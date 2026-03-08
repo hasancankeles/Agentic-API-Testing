@@ -16,6 +16,7 @@ backend/venv/
 # Environment variables
 .env
 .env.*
+.venv/
 
 # k6 generated scripts
 k6-scripts/*.js

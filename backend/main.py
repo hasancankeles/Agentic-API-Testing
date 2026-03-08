@@ -36,7 +36,11 @@ from models.schemas import (
     WebSocketTestCase,
 )
 from parser.openapi_parser import parse_openapi
-from generator.gemini_generator import generate_all
+from generator.gemini_generator import (
+    StructuredOutputError,
+    UpstreamModelError,
+    generate_all,
+)
 from executor.http_runner import run_test_cases
 from executor.ws_runner import run_ws_tests
 from loadtest.k6_runner import run_k6_test
@@ -107,9 +111,23 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
     parsed_api = ParsedAPI(**db_parsed.spec_json)
 
     try:
-        suites, load_scenarios = await generate_all(parsed_api, req.categories)
+        suites, load_scenarios, generation_meta = await generate_all(parsed_api, req.categories)
+    except StructuredOutputError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(e),
+                "stage": e.stage,
+                "errors": e.errors,
+                "repair_attempted": e.repair_attempted,
+            },
+        )
+    except UpstreamModelError as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Generation failed: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    batch_created_at = datetime.utcnow()
 
     for suite in suites:
         db_suite = DBTestSuite(
@@ -119,6 +137,7 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
             category=suite.category.value,
             test_cases_json=[tc.model_dump() for tc in suite.test_cases],
             ws_test_cases_json=[ws.model_dump() for ws in suite.ws_test_cases],
+            created_at=batch_created_at,
         )
         db.add(db_suite)
 
@@ -134,6 +153,7 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
             ramp_stages_json=scenario.ramp_stages,
             thresholds_json=scenario.thresholds,
             headers_json=scenario.headers,
+            created_at=batch_created_at,
         )
         db.add(db_scenario)
 
@@ -146,7 +166,9 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
             "test_suites_generated": len(suites),
             "total_test_cases": sum(len(s.test_cases) + len(s.ws_test_cases) for s in suites),
             "load_scenarios_generated": len(load_scenarios),
+            "batch_created_at": batch_created_at.isoformat(),
         },
+        "generation_meta": generation_meta.model_dump(),
     }
 
 
@@ -157,13 +179,28 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
 @app.post("/api/execute")
 async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db)):
     query = select(DBTestSuite)
+    latest_batch_created_at: datetime | None = None
     if req.suite_ids:
         query = query.where(DBTestSuite.id.in_(req.suite_ids))
+    else:
+        latest_batch_result = await db.execute(select(func.max(DBTestSuite.created_at)))
+        latest_batch_created_at = latest_batch_result.scalar_one_or_none()
+        if latest_batch_created_at:
+            query = query.where(DBTestSuite.created_at == latest_batch_created_at)
+
     result = await db.execute(query)
     db_suites = result.scalars().all()
 
     if not db_suites:
         raise HTTPException(status_code=404, detail="No test suites found")
+
+    target_base_url = req.target_base_url
+    if not target_base_url:
+        latest_parsed_result = await db.execute(
+            select(DBParsedAPI).order_by(DBParsedAPI.parsed_at.desc()).limit(1)
+        )
+        latest_parsed = latest_parsed_result.scalar_one_or_none()
+        target_base_url = latest_parsed.base_url if latest_parsed and latest_parsed.base_url else "http://localhost:8080"
 
     run_id = str(uuid.uuid4())
     started_at = datetime.utcnow()
@@ -174,7 +211,7 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
         ws_tests = [WebSocketTestCase(**ws) for ws in (db_suite.ws_test_cases_json or [])]
 
         if test_cases:
-            http_results = run_test_cases(test_cases, req.target_base_url)
+            http_results = run_test_cases(test_cases, target_base_url)
             for r in http_results:
                 r.suite_id = db_suite.id
                 r.suite_name = db_suite.name
@@ -233,6 +270,8 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
 
     return {
         "run_id": run_id,
+        "target_base_url": target_base_url,
+        "batch_created_at": latest_batch_created_at.isoformat() if latest_batch_created_at else None,
         "total": len(all_results),
         "passed": passed,
         "failed": failed,
@@ -249,8 +288,15 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
 @app.post("/api/loadtest/run")
 async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get_db)):
     query = select(DBLoadTestScenario)
+    latest_batch_created_at: datetime | None = None
     if req.scenario_ids:
         query = query.where(DBLoadTestScenario.id.in_(req.scenario_ids))
+    else:
+        latest_batch_result = await db.execute(select(func.max(DBLoadTestScenario.created_at)))
+        latest_batch_created_at = latest_batch_result.scalar_one_or_none()
+        if latest_batch_created_at:
+            query = query.where(DBLoadTestScenario.created_at == latest_batch_created_at)
+
     result = await db.execute(query)
     db_scenarios = result.scalars().all()
 
@@ -304,6 +350,7 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
     await db.commit()
 
     return {
+        "batch_created_at": latest_batch_created_at.isoformat() if latest_batch_created_at else None,
         "total_scenarios": len(all_metrics),
         "results": [m.model_dump() for m in all_metrics],
     }
@@ -314,8 +361,18 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
 # ──────────────────────────────────────────────
 
 @app.get("/api/suites")
-async def list_suites(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DBTestSuite).order_by(DBTestSuite.created_at.desc()))
+async def list_suites(
+    include_history: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(DBTestSuite)
+    if not include_history:
+        latest_batch_result = await db.execute(select(func.max(DBTestSuite.created_at)))
+        latest_batch_created_at = latest_batch_result.scalar_one_or_none()
+        if latest_batch_created_at:
+            query = query.where(DBTestSuite.created_at == latest_batch_created_at)
+
+    result = await db.execute(query.order_by(DBTestSuite.created_at.desc()))
     suites = result.scalars().all()
 
     output = []
@@ -449,8 +506,18 @@ async def list_load_test_results(
 
 
 @app.get("/api/loadtest/scenarios")
-async def list_load_test_scenarios(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DBLoadTestScenario).order_by(DBLoadTestScenario.created_at.desc()))
+async def list_load_test_scenarios(
+    include_history: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(DBLoadTestScenario)
+    if not include_history:
+        latest_batch_result = await db.execute(select(func.max(DBLoadTestScenario.created_at)))
+        latest_batch_created_at = latest_batch_result.scalar_one_or_none()
+        if latest_batch_created_at:
+            query = query.where(DBLoadTestScenario.created_at == latest_batch_created_at)
+
+    result = await db.execute(query.order_by(DBLoadTestScenario.created_at.desc()))
     scenarios = result.scalars().all()
 
     return [
@@ -472,35 +539,49 @@ async def list_load_test_scenarios(db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/dashboard/summary")
 async def dashboard_summary(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(
-            func.count(DBTestResult.id),
-            func.sum(case((DBTestResult.status == "passed", 1), else_=0)),
-            func.sum(case((DBTestResult.status == "failed", 1), else_=0)),
-            func.sum(case((DBTestResult.status == "error", 1), else_=0)),
-            func.avg(DBTestResult.response_time_ms),
+    latest_run_result = await db.execute(
+        select(DBTestRun.id).order_by(DBTestRun.started_at.desc()).limit(1)
+    )
+    latest_run_id = latest_run_result.scalar_one_or_none()
+
+    total = 0
+    passed = 0
+    failed = 0
+    errors = 0
+    avg_time = 0.0
+    functional_summary: dict[str, int] = {}
+    suite_summary: dict[str, int] = {}
+
+    if latest_run_id:
+        result = await db.execute(
+            select(
+                func.count(DBTestResult.id),
+                func.sum(case((DBTestResult.status == "passed", 1), else_=0)),
+                func.sum(case((DBTestResult.status == "failed", 1), else_=0)),
+                func.sum(case((DBTestResult.status == "error", 1), else_=0)),
+                func.avg(DBTestResult.response_time_ms),
+            ).where(DBTestResult.run_id == latest_run_id)
         )
-    )
-    row = result.one()
-    total = row[0] or 0
-    passed = row[1] or 0
-    failed = row[2] or 0
-    errors = row[3] or 0
-    avg_time = round(row[4] or 0, 2)
+        row = result.one()
+        total = row[0] or 0
+        passed = row[1] or 0
+        failed = row[2] or 0
+        errors = row[3] or 0
+        avg_time = round(row[4] or 0, 2)
 
-    func_result = await db.execute(
-        select(DBTestResult.status, func.count(DBTestResult.id))
-        .where(DBTestResult.category == "individual")
-        .group_by(DBTestResult.status)
-    )
-    functional_summary = dict(func_result.all())
+        func_result = await db.execute(
+            select(DBTestResult.status, func.count(DBTestResult.id))
+            .where(DBTestResult.category == "individual", DBTestResult.run_id == latest_run_id)
+            .group_by(DBTestResult.status)
+        )
+        functional_summary = dict(func_result.all())
 
-    suite_result = await db.execute(
-        select(DBTestResult.status, func.count(DBTestResult.id))
-        .where(DBTestResult.category == "suite")
-        .group_by(DBTestResult.status)
-    )
-    suite_summary = dict(suite_result.all())
+        suite_result = await db.execute(
+            select(DBTestResult.status, func.count(DBTestResult.id))
+            .where(DBTestResult.category == "suite", DBTestResult.run_id == latest_run_id)
+            .group_by(DBTestResult.status)
+        )
+        suite_summary = dict(suite_result.all())
 
     load_result = await db.execute(
         select(DBLoadTestResult).order_by(DBLoadTestResult.executed_at.desc()).limit(1)

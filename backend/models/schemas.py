@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator, model_validator
 
 
 class TestCategory(str, Enum):
@@ -77,6 +77,142 @@ class ParsedAPI(BaseModel):
     endpoints: list[ParsedEndpoint] = Field(default_factory=list)
     schemas: dict[str, Any] = Field(default_factory=dict)
     websocket_messages: list[ParsedWebSocketMessage] = Field(default_factory=list)
+
+
+# ── Planner contracts ──
+
+
+def _validate_normalized_path(value: str, field_name: str) -> str:
+    if not value.startswith("/"):
+        raise ValueError(f"{field_name} must start with '/'")
+    if "://" in value:
+        raise ValueError(f"{field_name} must be a normalized path, not a full URL")
+    if any(ch.isspace() for ch in value):
+        raise ValueError(f"{field_name} must not include whitespace")
+    return value
+
+
+class PlannerEndpointGroup(BaseModel):
+    name: StrictStr
+    description: str = ""
+    endpoints: list[StrictStr] = Field(default_factory=list)
+
+    @field_validator("endpoints")
+    @classmethod
+    def validate_endpoints(cls, endpoints: list[str]) -> list[str]:
+        return [_validate_normalized_path(endpoint, "endpoint_groups.endpoints") for endpoint in endpoints]
+
+
+class PlannerTestCaseDraft(BaseModel):
+    case_id: StrictStr
+    name: StrictStr
+    description: str = ""
+    endpoint: StrictStr
+    method: HttpMethod = HttpMethod.GET
+    expected_status: StrictInt = 200
+    category: TestCategory = TestCategory.INDIVIDUAL
+    headers: dict[str, StrictStr] = Field(default_factory=dict)
+    query_params: dict[str, StrictStr] = Field(default_factory=dict)
+    path_params: dict[str, StrictStr] = Field(default_factory=dict)
+    body_hint: Any = None
+    assertion_hints: list[TestAssertion] = Field(default_factory=list)
+    depends_on: list[StrictStr] = Field(default_factory=list)
+    intent_labels: list[StrictStr] = Field(default_factory=list)
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, endpoint: str) -> str:
+        return _validate_normalized_path(endpoint, "test_case.endpoint")
+
+    @field_validator("expected_status")
+    @classmethod
+    def validate_expected_status(cls, expected_status: int) -> int:
+        if expected_status < 100 or expected_status > 599:
+            raise ValueError("expected_status must be between 100 and 599")
+        return expected_status
+
+
+class PlannerSuiteDraft(BaseModel):
+    suite_id: StrictStr
+    name: StrictStr
+    description: str = ""
+    test_cases: list[PlannerTestCaseDraft] = Field(default_factory=list)
+    include_websocket: bool = False
+
+
+class PlannerRampStageDraft(BaseModel):
+    duration: StrictStr
+    target: StrictInt
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, target: int) -> int:
+        if target < 0:
+            raise ValueError("target must be >= 0")
+        return target
+
+
+class PlannerLoadScenarioDraft(BaseModel):
+    scenario_id: StrictStr
+    name: StrictStr
+    description: str = ""
+    target_endpoint: StrictStr
+    method: HttpMethod = HttpMethod.GET
+    vus: StrictInt = 10
+    duration: StrictStr = "30s"
+    ramp_stages: list[PlannerRampStageDraft] = Field(default_factory=list)
+    thresholds: dict[str, list[StrictStr]] = Field(default_factory=dict)
+    headers: dict[str, StrictStr] = Field(default_factory=dict)
+
+    @field_validator("target_endpoint")
+    @classmethod
+    def validate_target_endpoint(cls, target_endpoint: str) -> str:
+        return _validate_normalized_path(target_endpoint, "load_scenario.target_endpoint")
+
+    @field_validator("vus")
+    @classmethod
+    def validate_vus(cls, vus: int) -> int:
+        if vus <= 0:
+            raise ValueError("vus must be > 0")
+        return vus
+
+
+class PlannerTestPlan(BaseModel):
+    version: StrictStr = "1.0"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    assumptions: list[StrictStr] = Field(default_factory=list)
+    endpoint_groups: list[PlannerEndpointGroup] = Field(default_factory=list)
+    individual_tests: list[PlannerTestCaseDraft] = Field(default_factory=list)
+    suite_tests: list[PlannerSuiteDraft] = Field(default_factory=list)
+    load_scenarios: list[PlannerLoadScenarioDraft] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_unique_ids(self) -> "PlannerTestPlan":
+        case_ids: set[str] = set()
+        suite_ids: set[str] = set()
+        scenario_ids: set[str] = set()
+
+        for test_case in self.individual_tests:
+            if test_case.case_id in case_ids:
+                raise ValueError(f"Duplicate case_id found: {test_case.case_id}")
+            case_ids.add(test_case.case_id)
+
+        for suite in self.suite_tests:
+            if suite.suite_id in suite_ids:
+                raise ValueError(f"Duplicate suite_id found: {suite.suite_id}")
+            suite_ids.add(suite.suite_id)
+
+            for test_case in suite.test_cases:
+                if test_case.case_id in case_ids:
+                    raise ValueError(f"Duplicate case_id found: {test_case.case_id}")
+                case_ids.add(test_case.case_id)
+
+        for scenario in self.load_scenarios:
+            if scenario.scenario_id in scenario_ids:
+                raise ValueError(f"Duplicate scenario_id found: {scenario.scenario_id}")
+            scenario_ids.add(scenario.scenario_id)
+
+        return self
 
 
 # ── Test scenario models ──
@@ -218,6 +354,18 @@ class DashboardSummary(BaseModel):
     recent_runs: list[TestRunSummary] = Field(default_factory=list)
 
 
+class GenerationMeta(BaseModel):
+    planner_model: str
+    executor_model: str
+    repair_attempted: bool = False
+    dropped_items_count: int = 0
+    executor_jobs_total: int = 0
+    executor_jobs_succeeded: int = 0
+    executor_jobs_failed: int = 0
+    fallback_count: int = 0
+    executor_concurrency: int = 0
+
+
 # ── API request/response models ──
 
 
@@ -235,7 +383,7 @@ class GenerateRequest(BaseModel):
 
 class ExecuteRequest(BaseModel):
     suite_ids: list[str] | None = None
-    target_base_url: str = "http://localhost:8080"
+    target_base_url: str | None = None
 
 
 class LoadTestRunRequest(BaseModel):
