@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+google-genai
+greenlet
+pyyaml
+requests
+websockets
+sqlalchemy
+aiosqlite
+pydantic
+python-multipart

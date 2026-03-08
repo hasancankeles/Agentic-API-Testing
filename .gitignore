@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+backend/venv/
+
+# SQLite database
+*.db
+
+# Environment variables
+.env
+.env.*
+
+# k6 generated scripts
+k6-scripts/*.js
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Cursor
+.cursor/
