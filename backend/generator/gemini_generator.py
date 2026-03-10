@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import uuid
@@ -32,6 +33,7 @@ from models.schemas import (
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_PLANNER_MODEL = os.getenv("GEMINI_PLANNER_MODEL", "gemini-3.1-pro-preview")
 GEMINI_EXECUTOR_MODEL = os.getenv("GEMINI_EXECUTOR_MODEL", "gemini-3.1-flash-lite-preview")
+logger = logging.getLogger("agentic.generator")
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -44,8 +46,65 @@ def _get_env_int(name: str, default: int) -> int:
         return default
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 GENERATOR_REPAIR_MAX_ATTEMPTS = _get_env_int("GENERATOR_REPAIR_MAX_ATTEMPTS", 1)
 GENERATOR_EXECUTOR_CONCURRENCY = max(1, min(_get_env_int("GENERATOR_EXECUTOR_CONCURRENCY", 8), 32))
+GEN_DEBUG_ARTIFACTS = _get_env_bool("GEN_DEBUG_ARTIFACTS", True)
+GEN_CAPTURE_RAW_LLM = _get_env_bool("GEN_CAPTURE_RAW_LLM", False)
+
+SENSITIVE_KEY_MARKERS = (
+    "authorization",
+    "token",
+    "api_key",
+    "apikey",
+    "password",
+    "cookie",
+    "secret",
+    "x-api-key",
+)
+
+
+def _is_sensitive_key(key: object) -> bool:
+    lowered = str(key).strip().lower()
+    return any(marker in lowered for marker in SENSITIVE_KEY_MARKERS)
+
+
+def _sanitize_for_debug(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if _is_sensitive_key(key):
+                sanitized[str(key)] = "[REDACTED]"
+            else:
+                sanitized[str(key)] = _sanitize_for_debug(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_for_debug(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_debug(item) for item in value]
+    return value
+
+
+def _sanitize_raw_text(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    if len(text) > 20_000:
+        text = f"{text[:20_000]}\n...[truncated]"
+    if not text:
+        return text
+    try:
+        payload = _parse_json_response(text)
+        return json.dumps(_sanitize_for_debug(payload), ensure_ascii=True)
+    except Exception:
+        pattern = re.compile(
+            r'(?i)("?(authorization|token|api[_-]?key|password|cookie|secret)"?\s*[:=]\s*")([^"]*)(")'
+        )
+        return pattern.sub(r"\1[REDACTED]\4", text)
 
 
 class GenerationPipelineError(Exception):
@@ -143,12 +202,78 @@ class HttpExecutorJob:
 @dataclass
 class HttpExecutorQueueResult:
     enrichments: dict[str, ExecutorTestEnrichment] = field(default_factory=dict)
+    case_outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
     jobs_total: int = 0
     jobs_succeeded: int = 0
     jobs_failed: int = 0
     fallback_count: int = 0
     repair_attempted: bool = False
     max_in_flight: int = 0
+
+
+@dataclass
+class GenerationDebugCapture:
+    generation_id: str
+    parsed_api_id: str | None = None
+    parsed_api_title: str = ""
+    categories: list[str] = field(default_factory=list)
+    capture_raw_llm: bool = False
+    planner_plan: dict[str, Any] = field(default_factory=dict)
+    executor_case_outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    fallback_case_ids: list[str] = field(default_factory=list)
+    final_suites: list[dict[str, Any]] = field(default_factory=list)
+    final_load_scenarios: list[dict[str, Any]] = field(default_factory=list)
+    generation_meta: dict[str, Any] = field(default_factory=dict)
+    raw_llm_outputs: list[dict[str, Any]] = field(default_factory=list)
+
+    def set_planner_plan(self, plan: PlannerTestPlan) -> None:
+        self.planner_plan = _sanitize_for_debug(plan.model_dump(mode="json"))
+
+    def set_case_outcomes(self, case_outcomes: dict[str, dict[str, Any]]) -> None:
+        sanitized_outcomes = _sanitize_for_debug(case_outcomes)
+        self.executor_case_outcomes = sanitized_outcomes
+        fallback_ids = [
+            case_id
+            for case_id, outcome in sanitized_outcomes.items()
+            if isinstance(outcome, dict) and bool(outcome.get("fallback_used"))
+        ]
+        self.fallback_case_ids = sorted(set(fallback_ids))
+
+    def set_materialized_outputs(self, suites: list[TestSuite], load_scenarios: list[LoadTestScenario]) -> None:
+        self.final_suites = _sanitize_for_debug([suite.model_dump(mode="json") for suite in suites])
+        self.final_load_scenarios = _sanitize_for_debug(
+            [scenario.model_dump(mode="json") for scenario in load_scenarios]
+        )
+
+    def set_generation_meta(self, generation_meta: GenerationMeta) -> None:
+        self.generation_meta = _sanitize_for_debug(generation_meta.model_dump(mode="json"))
+
+    def record_raw_output(self, stage: str, attempt: int, is_repair: bool, raw_text: str) -> None:
+        if not self.capture_raw_llm:
+            return
+        self.raw_llm_outputs.append(
+            {
+                "stage": stage,
+                "attempt": attempt,
+                "is_repair": is_repair,
+                "raw_output": _sanitize_raw_text(raw_text),
+            }
+        )
+
+    def to_persist_payload(self, include_raw: bool) -> dict[str, Any]:
+        return {
+            "generation_id": self.generation_id,
+            "parsed_api_id": self.parsed_api_id,
+            "parsed_api_title": self.parsed_api_title,
+            "categories": _sanitize_for_debug(self.categories),
+            "planner_plan": _sanitize_for_debug(self.planner_plan),
+            "executor_case_outcomes": _sanitize_for_debug(self.executor_case_outcomes),
+            "fallback_case_ids": _sanitize_for_debug(self.fallback_case_ids),
+            "final_suites": _sanitize_for_debug(self.final_suites),
+            "final_load_scenarios": _sanitize_for_debug(self.final_load_scenarios),
+            "generation_meta": _sanitize_for_debug(self.generation_meta),
+            "raw_llm_outputs": _sanitize_for_debug(self.raw_llm_outputs) if include_raw else [],
+        }
 
 
 PLANNER_PROMPT = """You are a senior API test planner.
@@ -557,10 +682,13 @@ async def _model_validate_with_repair(
     prompt: str,
     stage: str,
     validator: Callable[[Any], T],
+    raw_output_observer: Callable[[str, int, bool, str], None] | None = None,
 ) -> tuple[T, bool]:
     repair_attempted = False
     attempts = 0
     raw_output = await _call_model_text(client, model_name, prompt, stage=stage)
+    if raw_output_observer is not None:
+        raw_output_observer(stage, attempts, False, raw_output)
 
     while True:
         try:
@@ -579,6 +707,8 @@ async def _model_validate_with_repair(
                 _build_repair_prompt(stage=stage, raw_output=raw_output, errors=errors),
                 stage=f"{stage}_repair",
             )
+            if raw_output_observer is not None:
+                raw_output_observer(stage, attempts, True, raw_output)
 
 
 def _categories_to_text(categories: list[TestCategory]) -> str:
@@ -638,7 +768,11 @@ def _draft_to_load_scenario(draft: PlannerLoadScenarioDraft, base_url: str) -> L
     )
 
 
-async def plan_tests(parsed_api: ParsedAPI, categories: list[TestCategory]) -> tuple[PlannerTestPlan, bool]:
+async def plan_tests(
+    parsed_api: ParsedAPI,
+    categories: list[TestCategory],
+    debug_capture: GenerationDebugCapture | None = None,
+) -> tuple[PlannerTestPlan, bool]:
     client = _get_client()
     planner_prompt = PLANNER_PROMPT.format(
         api_context=_build_api_context(parsed_api),
@@ -651,14 +785,20 @@ async def plan_tests(parsed_api: ParsedAPI, categories: list[TestCategory]) -> t
         prompt=planner_prompt,
         stage="planner",
         validator=_validate_planner_payload,
+        raw_output_observer=debug_capture.record_raw_output if debug_capture else None,
     )
 
-    return _normalize_planner_categories(plan, set(categories)), repair_attempted
+    normalized_plan = _normalize_planner_categories(plan, set(categories))
+    if debug_capture is not None:
+        debug_capture.set_planner_plan(normalized_plan)
+
+    return normalized_plan, repair_attempted
 
 
 async def _executor_output(
     plan: PlannerTestPlan,
     parsed_api: ParsedAPI,
+    raw_output_observer: Callable[[str, int, bool, str], None] | None = None,
 ) -> tuple[ExecutorOutput, bool]:
     client = _get_client()
     executor_prompt = EXECUTOR_PROMPT.format(
@@ -672,6 +812,7 @@ async def _executor_output(
         prompt=executor_prompt,
         stage="executor",
         validator=_validate_executor_payload,
+        raw_output_observer=raw_output_observer,
     )
 
 
@@ -704,6 +845,7 @@ async def _executor_call_for_case(
     client: genai.Client,
     parsed_api: ParsedAPI,
     draft: PlannerTestCaseDraft,
+    raw_output_observer: Callable[[str, int, bool, str], None] | None = None,
 ) -> tuple[ExecutorTestEnrichment, bool]:
     prompt = EXECUTOR_CASE_PROMPT.format(
         case_draft=json.dumps(draft.model_dump(mode="json"), indent=2),
@@ -715,6 +857,7 @@ async def _executor_call_for_case(
         prompt=prompt,
         stage=f"executor_case:{draft.case_id}",
         validator=lambda payload: _validate_executor_case_payload(payload, draft.case_id),
+        raw_output_observer=raw_output_observer,
     )
 
 
@@ -733,6 +876,7 @@ async def _run_http_executor_queue(
     parsed_api: ParsedAPI,
     jobs: list[HttpExecutorJob],
     concurrency: int,
+    raw_output_observer: Callable[[str, int, bool, str], None] | None = None,
 ) -> HttpExecutorQueueResult:
     result = HttpExecutorQueueResult(jobs_total=len(jobs))
     if not jobs:
@@ -759,15 +903,36 @@ async def _run_http_executor_queue(
                 result.max_in_flight = max(result.max_in_flight, in_flight)
 
             try:
-                enrichment, repair_attempted = await _executor_call_for_case(client, parsed_api, job.draft)
+                enrichment, repair_attempted = await _executor_call_for_case(
+                    client,
+                    parsed_api,
+                    job.draft,
+                    raw_output_observer=raw_output_observer,
+                )
                 async with state_lock:
                     result.enrichments[job.case_id] = enrichment
+                    result.case_outcomes[job.case_id] = {
+                        "status": "succeeded",
+                        "repair_attempted": repair_attempted,
+                        "fallback_used": False,
+                        "error_message": None,
+                    }
                     result.jobs_succeeded += 1
                     result.repair_attempted = result.repair_attempted or repair_attempted
             except Exception as exc:
                 async with state_lock:
+                    structured_repair_attempted = False
+                    error_message = str(exc)
                     if isinstance(exc, StructuredOutputError):
-                        result.repair_attempted = result.repair_attempted or exc.repair_attempted
+                        structured_repair_attempted = exc.repair_attempted
+                        result.repair_attempted = result.repair_attempted or structured_repair_attempted
+                        error_message = f"{exc.stage}: {json.dumps(exc.errors, default=str)}"
+                    result.case_outcomes[job.case_id] = {
+                        "status": "failed",
+                        "repair_attempted": structured_repair_attempted,
+                        "fallback_used": True,
+                        "error_message": error_message,
+                    }
                     result.jobs_failed += 1
                     result.fallback_count += 1
             finally:
@@ -823,6 +988,7 @@ async def materialize_tests(
     plan: PlannerTestPlan,
     parsed_api: ParsedAPI,
     categories: list[TestCategory],
+    debug_capture: GenerationDebugCapture | None = None,
 ) -> tuple[list[TestSuite], list[LoadTestScenario], int, bool, HttpExecutorQueueResult]:
     dropped_items_count = 0
     suites: list[TestSuite] = []
@@ -887,6 +1053,7 @@ async def materialize_tests(
             parsed_api=parsed_api,
             jobs=jobs,
             concurrency=GENERATOR_EXECUTOR_CONCURRENCY,
+            raw_output_observer=debug_capture.record_raw_output if debug_capture else None,
         )
         repair_attempted = queue_result.repair_attempted
 
@@ -897,10 +1064,17 @@ async def materialize_tests(
                 continue
             _apply_test_enrichment(target_case, enrichment, parsed_api.base_url)
 
+        if debug_capture is not None:
+            debug_capture.set_case_outcomes(queue_result.case_outcomes)
+
     # Keep existing websocket behavior as a best-effort enrichment path.
     if parsed_api.websocket_messages and TestCategory.SUITE in category_set and suites:
         try:
-            executor_output, ws_repair_attempted = await _executor_output(plan, parsed_api)
+            executor_output, ws_repair_attempted = await _executor_output(
+                plan,
+                parsed_api,
+                raw_output_observer=debug_capture.record_raw_output if debug_capture else None,
+            )
             repair_attempted = repair_attempted or ws_repair_attempted
         except Exception:
             executor_output = ExecutorOutput()
@@ -921,20 +1095,32 @@ async def materialize_tests(
                 )
             )
 
+    if debug_capture is not None:
+        debug_capture.set_materialized_outputs(suites, load_scenarios)
+
     return suites, load_scenarios, dropped_items_count, repair_attempted, queue_result
 
 
 async def generate_all(
-    parsed_api: ParsedAPI, categories: list[TestCategory] | None = None
+    parsed_api: ParsedAPI,
+    categories: list[TestCategory] | None = None,
+    debug_capture: GenerationDebugCapture | None = None,
 ) -> tuple[list[TestSuite], list[LoadTestScenario], GenerationMeta]:
     if categories is None:
         categories = [TestCategory.INDIVIDUAL, TestCategory.SUITE, TestCategory.LOAD]
+    if debug_capture is not None and not debug_capture.categories:
+        debug_capture.categories = [category.value for category in categories]
 
-    planner_plan, planner_repair_attempted = await plan_tests(parsed_api, categories)
+    planner_plan, planner_repair_attempted = await plan_tests(
+        parsed_api,
+        categories,
+        debug_capture=debug_capture,
+    )
     suites, load_scenarios, dropped_items_count, executor_repair_attempted, queue_result = await materialize_tests(
         planner_plan,
         parsed_api,
         categories,
+        debug_capture=debug_capture,
     )
 
     generation_meta = GenerationMeta(
@@ -948,5 +1134,14 @@ async def generate_all(
         fallback_count=queue_result.fallback_count,
         executor_concurrency=GENERATOR_EXECUTOR_CONCURRENCY,
     )
+    logger.info(
+        "generate.queue_complete jobs_total=%s jobs_succeeded=%s jobs_failed=%s fallback_count=%s",
+        queue_result.jobs_total,
+        queue_result.jobs_succeeded,
+        queue_result.jobs_failed,
+        queue_result.fallback_count,
+    )
+    if debug_capture is not None:
+        debug_capture.set_generation_meta(generation_meta)
 
     return suites, load_scenarios, generation_meta

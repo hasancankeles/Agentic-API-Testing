@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, JSON, Boolean
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, JSON
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -112,3 +112,20 @@ class DBParsedAPI(Base):
     base_url = Column(String, default="")
     spec_json = Column(JSON, nullable=False)
     parsed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DBGenerationArtifact(Base):
+    __tablename__ = "generation_artifacts"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    parsed_api_id = Column(String, nullable=True)
+    parsed_api_title = Column(String, default="")
+    categories_json = Column(JSON, default=list)
+    planner_plan_json = Column(JSON, default=dict)
+    executor_case_outcomes_json = Column(JSON, default=dict)
+    fallback_case_ids_json = Column(JSON, default=list)
+    suites_json = Column(JSON, default=list)
+    load_scenarios_json = Column(JSON, default=list)
+    generation_meta_json = Column(JSON, default=dict)
+    raw_llm_outputs_json = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow)

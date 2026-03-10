@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -12,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import get_db, init_db
 from db.models import (
+    DBGenerationArtifact,
     DBLoadTestResult,
     DBLoadTestScenario,
     DBParsedAPI,
@@ -37,6 +40,9 @@ from models.schemas import (
 )
 from parser.openapi_parser import parse_openapi
 from generator.gemini_generator import (
+    GEN_CAPTURE_RAW_LLM,
+    GEN_DEBUG_ARTIFACTS,
+    GenerationDebugCapture,
     StructuredOutputError,
     UpstreamModelError,
     generate_all,
@@ -44,6 +50,21 @@ from generator.gemini_generator import (
 from executor.http_runner import run_test_cases
 from executor.ws_runner import run_ws_tests
 from loadtest.k6_runner import run_k6_test
+
+
+def _get_env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip() or default
+
+
+LOG_LEVEL = _get_env_str("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("agentic.main")
 
 
 @asynccontextmanager
@@ -77,10 +98,12 @@ async def parse_spec(req: ParseRequest, db: AsyncSession = Depends(get_db)):
     source = req.spec_url or req.spec_path or req.spec_content
     if not source:
         raise HTTPException(status_code=400, detail="Provide spec_url, spec_path, or spec_content")
+    logger.info("parse.start source_kind=%s", "spec_url" if req.spec_url else "spec_path" if req.spec_path else "spec_content")
 
     try:
         parsed = parse_openapi(source)
     except Exception as e:
+        logger.exception("parse.failed error=%s", e)
         raise HTTPException(status_code=400, detail=f"Failed to parse spec: {e}")
 
     db_parsed = DBParsedAPI(
@@ -93,6 +116,7 @@ async def parse_spec(req: ParseRequest, db: AsyncSession = Depends(get_db)):
     )
     db.add(db_parsed)
     await db.commit()
+    logger.info("parse.complete parsed_api_id=%s title=%s base_url=%s", db_parsed.id, parsed.title, parsed.base_url)
 
     return {"id": db_parsed.id, "parsed_api": parsed.model_dump()}
 
@@ -103,16 +127,37 @@ async def parse_spec(req: ParseRequest, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/generate")
 async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db)):
+    generation_id = str(uuid.uuid4())
+    logger.info("generate.start generation_id=%s categories=%s", generation_id, [c.value for c in req.categories])
     result = await db.execute(select(DBParsedAPI).order_by(DBParsedAPI.parsed_at.desc()).limit(1))
     db_parsed = result.scalar_one_or_none()
     if not db_parsed:
         raise HTTPException(status_code=404, detail="No parsed API found. Call /api/parse first.")
 
     parsed_api = ParsedAPI(**db_parsed.spec_json)
+    debug_capture: GenerationDebugCapture | None = None
+    if GEN_DEBUG_ARTIFACTS:
+        debug_capture = GenerationDebugCapture(
+            generation_id=generation_id,
+            parsed_api_id=db_parsed.id,
+            parsed_api_title=parsed_api.title,
+            categories=[category.value for category in req.categories],
+            capture_raw_llm=GEN_CAPTURE_RAW_LLM,
+        )
 
     try:
-        suites, load_scenarios, generation_meta = await generate_all(parsed_api, req.categories)
+        suites, load_scenarios, generation_meta = await generate_all(
+            parsed_api,
+            req.categories,
+            debug_capture=debug_capture,
+        )
     except StructuredOutputError as e:
+        logger.warning(
+            "generate.structured_output_error generation_id=%s stage=%s repair_attempted=%s",
+            generation_id,
+            e.stage,
+            e.repair_attempted,
+        )
         raise HTTPException(
             status_code=422,
             detail={
@@ -123,8 +168,10 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
             },
         )
     except UpstreamModelError as e:
+        logger.warning("generate.upstream_error generation_id=%s status_code=%s error=%s", generation_id, e.status_code, e)
         raise HTTPException(status_code=e.status_code, detail=f"Generation failed: {e}")
     except Exception as e:
+        logger.exception("generate.failed generation_id=%s error=%s", generation_id, e)
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     batch_created_at = datetime.utcnow()
@@ -157,9 +204,40 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
         )
         db.add(db_scenario)
 
+    if debug_capture is not None:
+        if not debug_capture.final_suites and not debug_capture.final_load_scenarios:
+            debug_capture.set_materialized_outputs(suites, load_scenarios)
+        if not debug_capture.generation_meta:
+            debug_capture.set_generation_meta(generation_meta)
+
+        payload = debug_capture.to_persist_payload(include_raw=GEN_CAPTURE_RAW_LLM)
+        db_artifact = DBGenerationArtifact(
+            id=generation_id,
+            parsed_api_id=payload.get("parsed_api_id"),
+            parsed_api_title=str(payload.get("parsed_api_title") or ""),
+            categories_json=payload.get("categories") or [],
+            planner_plan_json=payload.get("planner_plan") or {},
+            executor_case_outcomes_json=payload.get("executor_case_outcomes") or {},
+            fallback_case_ids_json=payload.get("fallback_case_ids") or [],
+            suites_json=payload.get("final_suites") or [],
+            load_scenarios_json=payload.get("final_load_scenarios") or [],
+            generation_meta_json=payload.get("generation_meta") or {},
+            raw_llm_outputs_json=payload.get("raw_llm_outputs") or [],
+            created_at=batch_created_at,
+        )
+        db.add(db_artifact)
+
     await db.commit()
+    logger.info(
+        "generate.complete generation_id=%s suites=%s load_scenarios=%s fallback_count=%s",
+        generation_id,
+        len(suites),
+        len(load_scenarios),
+        generation_meta.fallback_count,
+    )
 
     return {
+        "generation_id": generation_id,
         "suites": [s.model_dump() for s in suites],
         "load_scenarios": [s.model_dump() for s in load_scenarios],
         "summary": {
@@ -178,6 +256,7 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
 
 @app.post("/api/execute")
 async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db)):
+    logger.info("execute.start suite_ids=%s target_base_url=%s", req.suite_ids, req.target_base_url)
     query = select(DBTestSuite)
     latest_batch_created_at: datetime | None = None
     if req.suite_ids:
@@ -267,6 +346,14 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
         db.add(db_result)
 
     await db.commit()
+    logger.info(
+        "execute.complete run_id=%s total=%s passed=%s failed=%s errors=%s",
+        run_id,
+        len(all_results),
+        passed,
+        failed,
+        errors,
+    )
 
     return {
         "run_id": run_id,
@@ -287,6 +374,7 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
 
 @app.post("/api/loadtest/run")
 async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get_db)):
+    logger.info("loadtest.start scenario_ids=%s target_base_url=%s", req.scenario_ids, req.target_base_url)
     query = select(DBLoadTestScenario)
     latest_batch_created_at: datetime | None = None
     if req.scenario_ids:
@@ -348,6 +436,7 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
         db.add(db_result)
 
     await db.commit()
+    logger.info("loadtest.complete total_scenarios=%s", len(all_metrics))
 
     return {
         "batch_created_at": latest_batch_created_at.isoformat() if latest_batch_created_at else None,
@@ -535,6 +624,81 @@ async def list_load_test_scenarios(
         }
         for s in scenarios
     ]
+
+
+def _count_suite_tests(suites_json: list[dict[str, Any]] | None) -> int:
+    if not suites_json:
+        return 0
+    total = 0
+    for suite in suites_json:
+        if not isinstance(suite, dict):
+            continue
+        total += len(suite.get("test_cases") or [])
+        total += len(suite.get("ws_test_cases") or [])
+    return total
+
+
+def _artifact_summary(artifact: DBGenerationArtifact) -> dict[str, Any]:
+    generation_meta = artifact.generation_meta_json or {}
+    suites = artifact.suites_json or []
+    load_scenarios = artifact.load_scenarios_json or []
+    return {
+        "generation_id": artifact.id,
+        "parsed_api_id": artifact.parsed_api_id,
+        "parsed_api_title": artifact.parsed_api_title,
+        "categories": artifact.categories_json or [],
+        "suites_generated": len(suites),
+        "total_test_cases": _count_suite_tests(suites),
+        "load_scenarios_generated": len(load_scenarios),
+        "executor_jobs_total": generation_meta.get("executor_jobs_total", 0),
+        "executor_jobs_failed": generation_meta.get("executor_jobs_failed", 0),
+        "fallback_count": generation_meta.get("fallback_count", 0),
+        "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+    }
+
+
+@app.get("/api/generations")
+async def list_generations(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(DBGenerationArtifact)
+        .order_by(DBGenerationArtifact.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    artifacts = result.scalars().all()
+    return [_artifact_summary(artifact) for artifact in artifacts]
+
+
+@app.get("/api/generations/{generation_id}")
+async def get_generation_artifact(
+    generation_id: str,
+    include_raw: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DBGenerationArtifact).where(DBGenerationArtifact.id == generation_id))
+    artifact = result.scalar_one_or_none()
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Generation artifact not found")
+
+    return {
+        "generation_id": artifact.id,
+        "parsed_api_id": artifact.parsed_api_id,
+        "parsed_api_title": artifact.parsed_api_title,
+        "categories": artifact.categories_json or [],
+        "planner_plan": artifact.planner_plan_json or {},
+        "executor_case_outcomes": artifact.executor_case_outcomes_json or {},
+        "fallback_case_ids": artifact.fallback_case_ids_json or [],
+        "suites": artifact.suites_json or [],
+        "load_scenarios": artifact.load_scenarios_json or [],
+        "generation_meta": artifact.generation_meta_json or {},
+        "raw_llm_outputs": (artifact.raw_llm_outputs_json or []) if include_raw else [],
+        "raw_llm_outputs_included": include_raw,
+        "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+    }
 
 
 @app.get("/api/dashboard/summary")

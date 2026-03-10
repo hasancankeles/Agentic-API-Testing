@@ -13,10 +13,12 @@ if str(ROOT) not in sys.path:
 
 from generator.gemini_generator import (  # noqa: E402
     ExecutorTestEnrichment,
+    GenerationDebugCapture,
     HttpExecutorJob,
     _normalize_assertions,
     _normalize_endpoint_path,
     _run_http_executor_queue,
+    _sanitize_for_debug,
     StructuredOutputError,
     UpstreamModelError,
     generate_all,
@@ -121,6 +123,18 @@ def _all_cases(suites: list) -> list:
 
 
 class GeminiGeneratorTests(IsolatedAsyncioTestCase):
+    def test_sanitize_for_debug_redacts_sensitive_keys(self) -> None:
+        payload = {
+            "authorization": "Bearer abc",
+            "nested": {"password": "secret", "api_key": "xyz"},
+            "safe": {"name": "demo"},
+        }
+        sanitized = _sanitize_for_debug(payload)
+        self.assertEqual(sanitized["authorization"], "[REDACTED]")
+        self.assertEqual(sanitized["nested"]["password"], "[REDACTED]")
+        self.assertEqual(sanitized["nested"]["api_key"], "[REDACTED]")
+        self.assertEqual(sanitized["safe"]["name"], "demo")
+
     def test_normalize_endpoint_path(self) -> None:
         base_url = "https://example.com/api/v1"
         self.assertEqual(_normalize_endpoint_path("/api/v1/pets", base_url), "/pets")
@@ -147,8 +161,14 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
 
     async def test_generate_all_success_with_per_case_executor_queue(self) -> None:
         parsed = _parsed_api()
+        capture = GenerationDebugCapture(generation_id="gen_1")
 
-        async def fake_executor_call(_client: object, _parsed: ParsedAPI, draft: PlannerTestCaseDraft):
+        async def fake_executor_call(
+            _client: object,
+            _parsed: ParsedAPI,
+            draft: PlannerTestCaseDraft,
+            raw_output_observer=None,
+        ):
             return (
                 ExecutorTestEnrichment(
                     case_id=draft.case_id,
@@ -165,6 +185,7 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
             suites, load_scenarios, generation_meta = await generate_all(
                 parsed,
                 [TestCategory.INDIVIDUAL, TestCategory.SUITE, TestCategory.LOAD],
+                debug_capture=capture,
             )
 
         self.assertEqual(len(suites), 2)
@@ -179,11 +200,22 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
         self.assertEqual(generation_meta.fallback_count, 0)
         self.assertTrue(generation_meta.planner_model)
         self.assertTrue(generation_meta.executor_model)
+        self.assertIn("version", capture.planner_plan)
+        self.assertEqual(len(capture.executor_case_outcomes), 2)
+        self.assertEqual(capture.executor_case_outcomes["case_ind_1"]["status"], "succeeded")
+        self.assertEqual(len(capture.final_suites), 2)
+        self.assertEqual(capture.generation_meta.get("executor_jobs_total"), 2)
 
     async def test_generate_all_per_case_structured_failure_uses_fallback(self) -> None:
         parsed = _parsed_api()
+        capture = GenerationDebugCapture(generation_id="gen_2")
 
-        async def fake_executor_call(_client: object, _parsed: ParsedAPI, draft: PlannerTestCaseDraft):
+        async def fake_executor_call(
+            _client: object,
+            _parsed: ParsedAPI,
+            draft: PlannerTestCaseDraft,
+            raw_output_observer=None,
+        ):
             if draft.case_id == "case_ind_1":
                 raise StructuredOutputError(
                     stage=f"executor_case:{draft.case_id}",
@@ -206,6 +238,7 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
             suites, _load_scenarios, generation_meta = await generate_all(
                 parsed,
                 [TestCategory.INDIVIDUAL, TestCategory.SUITE],
+                debug_capture=capture,
             )
 
         cases_by_name = {case.name: case for case in _all_cases(suites)}
@@ -216,11 +249,31 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
         self.assertEqual(generation_meta.executor_jobs_failed, 1)
         self.assertEqual(generation_meta.fallback_count, 1)
         self.assertTrue(generation_meta.repair_attempted)
+        self.assertIn("case_ind_1", capture.fallback_case_ids)
+        self.assertEqual(capture.executor_case_outcomes["case_ind_1"]["status"], "failed")
+        self.assertTrue(capture.executor_case_outcomes["case_ind_1"]["fallback_used"])
+
+    def test_debug_capture_raw_output_obeys_capture_flag(self) -> None:
+        capture_disabled = GenerationDebugCapture(generation_id="gen_3", capture_raw_llm=False)
+        capture_disabled.record_raw_output("planner", 0, False, '{"token":"abc"}')
+        self.assertEqual(capture_disabled.raw_llm_outputs, [])
+
+        capture_enabled = GenerationDebugCapture(generation_id="gen_4", capture_raw_llm=True)
+        capture_enabled.record_raw_output("planner", 0, False, '{"token":"abc","safe":"ok"}')
+        self.assertEqual(len(capture_enabled.raw_llm_outputs), 1)
+        raw = capture_enabled.raw_llm_outputs[0]["raw_output"]
+        self.assertIn("[REDACTED]", raw)
+        self.assertNotIn("abc", raw)
 
     async def test_generate_all_per_case_upstream_failure_uses_fallback(self) -> None:
         parsed = _parsed_api()
 
-        async def fake_executor_call(_client: object, _parsed: ParsedAPI, draft: PlannerTestCaseDraft):
+        async def fake_executor_call(
+            _client: object,
+            _parsed: ParsedAPI,
+            draft: PlannerTestCaseDraft,
+            raw_output_observer=None,
+        ):
             if draft.case_id == "case_suite_1":
                 raise UpstreamModelError("executor timeout", status_code=503)
             return (
@@ -266,7 +319,12 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
             for i in range(12)
         ]
 
-        async def fake_executor_call(_client: object, _parsed: ParsedAPI, draft: PlannerTestCaseDraft):
+        async def fake_executor_call(
+            _client: object,
+            _parsed: ParsedAPI,
+            draft: PlannerTestCaseDraft,
+            raw_output_observer=None,
+        ):
             await asyncio.sleep(0.01)
             return ExecutorTestEnrichment(case_id=draft.case_id), False
 
