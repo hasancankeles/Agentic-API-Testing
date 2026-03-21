@@ -422,9 +422,10 @@ T = TypeVar("T")
 
 
 def _get_client() -> genai.Client:
-    if not GEMINI_API_KEY:
+    api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip()
+    if not api_key:
         raise ValueError("GEMINI_API_KEY environment variable is not set")
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(api_key=api_key)
 
 
 def _build_api_context(parsed_api: ParsedAPI) -> str:

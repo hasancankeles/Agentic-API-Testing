@@ -3,12 +3,14 @@ import Dashboard from './pages/Dashboard';
 import TestResults from './pages/TestResults';
 import TestSuites from './pages/TestSuites';
 import LoadTests from './pages/LoadTests';
+import FlowTests from './pages/FlowTests';
 
 const navItems = [
   { to: '/', label: 'Dashboard' },
   { to: '/suites', label: 'Test Suites' },
   { to: '/results', label: 'Test Results' },
   { to: '/load-tests', label: 'Load Tests' },
+  { to: '/flows', label: 'Flow Tests' },
 ];
 
 function App() {
@@ -45,6 +47,7 @@ function App() {
           <Route path="/suites" element={<TestSuites />} />
           <Route path="/results" element={<TestResults />} />
           <Route path="/load-tests" element={<LoadTests />} />
+          <Route path="/flows" element={<FlowTests />} />
         </Routes>
       </div>
     </BrowserRouter>
