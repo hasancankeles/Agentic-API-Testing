@@ -129,3 +129,51 @@ class DBGenerationArtifact(Base):
     generation_meta_json = Column(JSON, default=dict)
     raw_llm_outputs_json = Column(JSON, default=list)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DBFlowScenario(Base):
+    __tablename__ = "flow_scenarios"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    persona = Column(String, default="")
+    preconditions_json = Column(JSON, default=list)
+    tags_json = Column(JSON, default=list)
+    steps_json = Column(JSON, default=list)
+    source_generation_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DBFlowRun(Base):
+    __tablename__ = "flow_runs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    flow_id = Column(String, nullable=False)
+    flow_name = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    target_base_url = Column(String, nullable=False)
+    initial_context_json = Column(JSON, default=dict)
+    final_context_json = Column(JSON, default=dict)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+
+
+class DBFlowStepResult(Base):
+    __tablename__ = "flow_step_results"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    flow_run_id = Column(String, nullable=False)
+    flow_id = Column(String, nullable=False)
+    step_id = Column(String, nullable=False)
+    step_order = Column(Integer, nullable=False)
+    status = Column(String, nullable=False)
+    resolved_request_json = Column(JSON, default=dict)
+    response_status = Column(Integer, nullable=True)
+    response_headers_json = Column(JSON, default=dict)
+    response_body_json = Column(JSON, nullable=True)
+    assertions_passed = Column(Integer, default=0)
+    assertions_total = Column(Integer, default=0)
+    extracted_context_delta_json = Column(JSON, default=dict)
+    error_message = Column(Text, nullable=True)
+    executed_at = Column(DateTime, default=datetime.utcnow)

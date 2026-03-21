@@ -118,6 +118,157 @@ export interface LoadTestScenario {
   created_at: string;
 }
 
+export type FlowGenerationMode =
+  | 'hybrid_auto'
+  | 'llm_first'
+  | 'deterministic_first';
+
+export type FlowMutationPolicy =
+  | 'safe'
+  | 'balanced'
+  | 'full_lifecycle';
+
+export interface FlowExtractRule {
+  var: string;
+  from: 'body' | 'headers' | 'status_code';
+  path: string;
+  required: boolean;
+}
+
+export interface FlowAssertion {
+  field: string;
+  operator: string;
+  expected: unknown;
+}
+
+export interface FlowStep {
+  step_id: string;
+  order: number;
+  name: string;
+  method: string;
+  endpoint: string;
+  headers: Record<string, unknown>;
+  query_params: Record<string, unknown>;
+  path_params: Record<string, unknown>;
+  body: unknown;
+  extract: FlowExtractRule[];
+  assertions: FlowAssertion[];
+  expected_status: number | null;
+  required: boolean;
+}
+
+export interface FlowScenario {
+  id: string;
+  name: string;
+  description: string;
+  persona: string;
+  preconditions: string[];
+  tags: string[];
+  steps: FlowStep[];
+  created_at: string;
+  source_generation_id: string | null;
+}
+
+export interface FlowListItem {
+  id: string;
+  name: string;
+  description: string;
+  persona: string;
+  tags: string[];
+  step_count: number;
+  source_generation_id: string | null;
+  created_at: string | null;
+}
+
+export interface FlowGenerateRequest {
+  max_flows?: number;
+  max_steps_per_flow?: number;
+  objectives?: string[];
+  include_negative?: boolean;
+  generation_mode?: FlowGenerationMode;
+  mutation_policy?: FlowMutationPolicy;
+  app_context?: Record<string, unknown>;
+  personas?: string[];
+}
+
+export interface FlowGenerationSummary {
+  flows_generated: number;
+  source: string;
+  fallback_used: boolean;
+  fallback_reason: string;
+  dependency_hints_count: number;
+  openapi_link_hints_count: number;
+  objectives_used?: string[];
+  generation_mode?: FlowGenerationMode;
+  mutation_policy?: FlowMutationPolicy;
+  deterministic_quality_dropped?: number;
+  batch_created_at: string;
+}
+
+export interface FlowGenerateResponse {
+  flow_generation_id: string;
+  flows: FlowScenario[];
+  summary: FlowGenerationSummary;
+}
+
+export interface FlowRunRequest {
+  flow_ids?: string[];
+  target_base_url?: string;
+  initial_context: Record<string, unknown>;
+}
+
+export interface FlowStepRunResult {
+  id: string;
+  flow_run_id: string;
+  flow_id: string;
+  step_id: string;
+  order: number;
+  status: string;
+  resolved_request: Record<string, unknown>;
+  response_status: number | null;
+  response_headers: Record<string, unknown>;
+  response_body: unknown;
+  assertions_passed: number;
+  assertions_total: number;
+  extracted_context_delta: Record<string, unknown>;
+  error_message: string | null;
+  executed_at: string | null;
+}
+
+export interface FlowRunRecord {
+  id: string;
+  flow_id: string;
+  flow_name: string;
+  status: string;
+  target_base_url: string;
+  initial_context: Record<string, unknown>;
+  final_context: Record<string, unknown>;
+  started_at: string | null;
+  finished_at: string | null;
+  step_results: FlowStepRunResult[];
+}
+
+export interface FlowRunGroupResponse {
+  run_group_id: string;
+  total_flows: number;
+  passed: number;
+  failed: number;
+  errors: number;
+  flow_runs: FlowRunRecord[];
+}
+
+export interface FlowRunListItem {
+  id: string;
+  flow_id: string;
+  flow_name: string;
+  status: string;
+  target_base_url: string;
+  initial_context: Record<string, unknown>;
+  final_context: Record<string, unknown>;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 export const getDashboard = () => api.get<DashboardSummary>('/dashboard/summary');
 
 export const parseSpec = (data: { spec_url?: string; spec_path?: string; spec_content?: string }) =>
@@ -155,5 +306,23 @@ export const getLoadTestResults = (scenarioId?: string) =>
 export const getLoadTestScenarios = () => api.get<LoadTestScenario[]>('/loadtest/scenarios');
 
 export const getRuns = (limit?: number) => api.get<TestRun[]>('/runs', { params: { limit: limit ?? 20 } });
+
+export const generateFlows = (payload: FlowGenerateRequest) =>
+  api.post<FlowGenerateResponse>('/flows/generate', payload);
+
+export const listFlows = (latestBatch = true) =>
+  api.get<FlowListItem[]>('/flows', { params: { latest_batch: latestBatch } });
+
+export const getFlow = (flowId: string) =>
+  api.get<FlowScenario>(`/flows/${flowId}`);
+
+export const runFlows = (payload: FlowRunRequest) =>
+  api.post<FlowRunGroupResponse>('/flows/run', payload);
+
+export const listFlowRuns = (limit?: number) =>
+  api.get<FlowRunListItem[]>('/flows/runs', { params: { limit: limit ?? 20 } });
+
+export const getFlowRun = (runId: string) =>
+  api.get<FlowRunRecord>(`/flows/runs/${runId}`);
 
 export default api;
