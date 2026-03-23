@@ -102,8 +102,16 @@ export interface LoadTestResult {
   data_sent_kb: number;
   duration_seconds: number;
   vus_max: number;
+  runner_status: string;
+  runner_message: string;
+  runner_exit_code: number | null;
+  runner_stdout_excerpt: string;
+  runner_stderr_excerpt: string;
+  raw_metrics?: Record<string, unknown>;
   executed_at: string;
 }
+
+export type LoadTestPreset = 'smoke' | 'load' | 'stress';
 
 export interface LoadTestScenario {
   id: string;
@@ -115,7 +123,65 @@ export interface LoadTestScenario {
   duration: string;
   ramp_stages: { duration: string; target: number }[];
   thresholds: Record<string, string[]>;
+  headers: Record<string, string>;
+  query_params: Record<string, unknown>;
+  body: unknown;
+  expected_statuses: number[];
   created_at: string;
+}
+
+export interface LoadTestScenarioUpsertRequest {
+  id?: string;
+  name: string;
+  description?: string;
+  target_url: string;
+  method: string;
+  vus: number;
+  duration: string;
+  ramp_stages: { duration: string; target: number }[];
+  thresholds: Record<string, string[]>;
+  headers: Record<string, string>;
+  query_params: Record<string, unknown>;
+  body: unknown;
+  expected_statuses: number[];
+  preset?: LoadTestPreset | null;
+}
+
+export interface LoadTestProfile {
+  id: string;
+  name: string;
+  base_url: string;
+  default_headers: Record<string, string>;
+}
+
+export interface LoadTestProfilesResponse {
+  profiles: LoadTestProfile[];
+  presets: Record<
+    string,
+    {
+      vus: number;
+      duration: string;
+      ramp_stages: { duration: string; target: number }[];
+      thresholds: Record<string, string[]>;
+    }
+  >;
+}
+
+export interface LoadTestRunRequest {
+  scenario_ids?: string[];
+  target_base_url?: string;
+  profile_id?: string;
+  headers_override?: Record<string, string>;
+}
+
+export interface LoadTestRunResponse {
+  batch_created_at: string | null;
+  profile_id: string | null;
+  total_scenarios: number;
+  passed: number;
+  failed: number;
+  errors: number;
+  results: LoadTestResult[];
 }
 
 export type FlowGenerationMode =
@@ -280,8 +346,8 @@ export const generateTests = (categories?: string[]) =>
 export const executeTests = (data: { suite_ids?: string[]; target_base_url?: string }) =>
   api.post('/execute', data);
 
-export const runLoadTests = (data: { scenario_ids?: string[]; target_base_url?: string }) =>
-  api.post('/loadtest/run', data);
+export const runLoadTests = (data: LoadTestRunRequest) =>
+  api.post<LoadTestRunResponse>('/loadtest/run', data);
 
 export const getSuites = () => api.get<Suite[]>('/suites');
 
@@ -300,10 +366,32 @@ export const getResults = (params?: {
 
 export const getResult = (id: string) => api.get<TestResult>(`/results/${id}`);
 
-export const getLoadTestResults = (scenarioId?: string) =>
-  api.get<LoadTestResult[]>('/loadtest/results', { params: scenarioId ? { scenario_id: scenarioId } : {} });
+export const getLoadTestResults = (params?: {
+  scenario_id?: string;
+  limit?: number;
+  include_raw?: boolean;
+}) =>
+  api.get<LoadTestResult[]>('/loadtest/results', { params: params ?? {} });
 
-export const getLoadTestScenarios = () => api.get<LoadTestScenario[]>('/loadtest/scenarios');
+export const getLoadTestScenarios = (includeHistory = false) =>
+  api.get<LoadTestScenario[]>('/loadtest/scenarios', {
+    params: { include_history: includeHistory },
+  });
+
+export const createLoadTestScenario = (payload: LoadTestScenarioUpsertRequest) =>
+  api.post<LoadTestScenario>('/loadtest/scenarios', payload);
+
+export const updateLoadTestScenario = (scenarioId: string, payload: LoadTestScenarioUpsertRequest) =>
+  api.put<LoadTestScenario>(`/loadtest/scenarios/${scenarioId}`, payload);
+
+export const deleteLoadTestScenario = (scenarioId: string) =>
+  api.delete<{ id: string; deleted: boolean }>(`/loadtest/scenarios/${scenarioId}`);
+
+export const getLoadTestProfiles = () =>
+  api.get<LoadTestProfilesResponse>('/loadtest/profiles');
+
+export const getLoadTestResult = (resultId: string, includeRaw = true) =>
+  api.get<LoadTestResult>(`/loadtest/results/${resultId}`, { params: { include_raw: includeRaw } });
 
 export const getRuns = (limit?: number) => api.get<TestRun[]>('/runs', { params: { limit: limit ?? 20 } });
 

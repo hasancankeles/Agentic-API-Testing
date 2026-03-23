@@ -73,6 +73,9 @@ class DBLoadTestScenario(Base):
     ramp_stages_json = Column(JSON, default=list)
     thresholds_json = Column(JSON, default=dict)
     headers_json = Column(JSON, default=dict)
+    query_params_json = Column(JSON, default=dict)
+    body_json = Column(JSON, nullable=True)
+    expected_statuses_json = Column(JSON, default=list)
     k6_script = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -98,6 +101,11 @@ class DBLoadTestResult(Base):
     data_sent_kb = Column(Float, default=0)
     duration_seconds = Column(Float, default=0)
     vus_max = Column(Integer, default=0)
+    runner_status = Column(String, default="passed")
+    runner_message = Column(Text, default="")
+    runner_exit_code = Column(Integer, nullable=True)
+    runner_stdout_excerpt = Column(Text, default="")
+    runner_stderr_excerpt = Column(Text, default="")
     raw_metrics = Column(JSON, default=dict)
     executed_at = Column(DateTime, default=datetime.utcnow)
 

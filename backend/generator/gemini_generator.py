@@ -766,6 +766,9 @@ def _draft_to_load_scenario(draft: PlannerLoadScenarioDraft, base_url: str) -> L
         ramp_stages=[{"duration": stage.duration, "target": int(stage.target)} for stage in draft.ramp_stages],
         thresholds={k: [str(v) for v in values] for k, values in draft.thresholds.items()},
         headers={k: str(v) for k, v in draft.headers.items()},
+        query_params={},
+        body=None,
+        expected_statuses=[200],
     )
 
 

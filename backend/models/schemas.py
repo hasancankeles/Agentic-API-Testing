@@ -31,6 +31,12 @@ class HttpMethod(str, Enum):
     HEAD = "HEAD"
 
 
+class LoadTestPreset(str, Enum):
+    SMOKE = "smoke"
+    LOAD = "load"
+    STRESS = "stress"
+
+
 # ── OpenAPI parsed models ──
 
 
@@ -320,6 +326,32 @@ class LoadTestScenario(BaseModel):
     ramp_stages: list[dict[str, Any]] = Field(default_factory=list)
     thresholds: dict[str, list[str]] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, Any] = Field(default_factory=dict)
+    body: Any = None
+    expected_statuses: list[int] = Field(default_factory=lambda: [200])
+
+    @field_validator("expected_statuses")
+    @classmethod
+    def validate_expected_statuses(cls, expected_statuses: list[int]) -> list[int]:
+        cleaned: list[int] = []
+        seen: set[int] = set()
+        for status in expected_statuses or [200]:
+            value = int(status)
+            if value < 100 or value > 599:
+                raise ValueError("expected_statuses values must be between 100 and 599")
+            if value not in seen:
+                cleaned.append(value)
+                seen.add(value)
+        if not cleaned:
+            cleaned = [200]
+        return cleaned
+
+
+class LoadTestProfile(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    default_headers: dict[str, str] = Field(default_factory=dict)
 
 
 class LoadTestMetrics(BaseModel):
@@ -342,7 +374,34 @@ class LoadTestMetrics(BaseModel):
     executed_at: datetime = Field(default_factory=datetime.utcnow)
     duration_seconds: float = 0
     vus_max: int = 0
+    runner_status: str = "passed"
+    runner_message: str = ""
+    runner_exit_code: int | None = None
+    runner_stdout_excerpt: str = ""
+    runner_stderr_excerpt: str = ""
     raw_metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class LoadTestScenarioUpsertRequest(BaseModel):
+    id: str = ""
+    name: str
+    description: str = ""
+    target_url: str
+    method: HttpMethod = HttpMethod.GET
+    vus: int = 10
+    duration: str = "30s"
+    ramp_stages: list[dict[str, Any]] = Field(default_factory=list)
+    thresholds: dict[str, list[str]] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, Any] = Field(default_factory=dict)
+    body: Any = None
+    expected_statuses: list[int] = Field(default_factory=lambda: [200])
+    preset: LoadTestPreset | None = None
+
+    @field_validator("expected_statuses")
+    @classmethod
+    def validate_expected_statuses(cls, expected_statuses: list[int]) -> list[int]:
+        return LoadTestScenario.validate_expected_statuses(expected_statuses)
 
 
 # ── Dashboard ──
@@ -537,7 +596,9 @@ class ExecuteRequest(BaseModel):
 
 class LoadTestRunRequest(BaseModel):
     scenario_ids: list[str] | None = None
-    target_base_url: str = "http://localhost:8080"
+    target_base_url: str | None = None
+    profile_id: str | None = None
+    headers_override: dict[str, str] = Field(default_factory=dict)
 
 
 class FlowGenerateRequest(BaseModel):

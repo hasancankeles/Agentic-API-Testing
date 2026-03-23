@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,8 +51,10 @@ from models.schemas import (
     FlowStepResult,
     GenerateRequest,
     LoadTestMetrics,
+    LoadTestPreset,
     LoadTestRunRequest,
     LoadTestScenario,
+    LoadTestScenarioUpsertRequest,
     ParsedAPI,
     ParseRequest,
     TestCase,
@@ -72,7 +75,13 @@ from generator.gemini_generator import (
 )
 from executor.http_runner import run_test_cases
 from executor.ws_runner import run_ws_tests
+from loadtest.k6_generator import get_all_load_test_presets, load_test_preset_config
 from loadtest.k6_runner import run_k6_test
+from loadtest.profiles import (
+    LoadProfileResolutionError,
+    get_load_test_profiles,
+    resolve_profile_headers,
+)
 from flows.generator import generate_flows
 from flows.runner import run_flow_scenario
 
@@ -225,6 +234,9 @@ async def generate_tests(req: GenerateRequest, db: AsyncSession = Depends(get_db
             ramp_stages_json=scenario.ramp_stages,
             thresholds_json=scenario.thresholds,
             headers_json=scenario.headers,
+            query_params_json=scenario.query_params,
+            body_json=scenario.body,
+            expected_statuses_json=scenario.expected_statuses,
             created_at=batch_created_at,
         )
         db.add(db_scenario)
@@ -397,9 +409,133 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
 #  Load Tests
 # ──────────────────────────────────────────────
 
+
+def _coerce_headers(headers: dict[str, Any] | None) -> dict[str, str]:
+    return {str(k): str(v) for k, v in (headers or {}).items()}
+
+
+def _merge_headers(
+    scenario_headers: dict[str, Any] | None,
+    profile_headers: dict[str, str],
+    override_headers: dict[str, str],
+) -> dict[str, str]:
+    merged = _coerce_headers(scenario_headers)
+    merged.update(_coerce_headers(profile_headers))
+    merged.update(_coerce_headers(override_headers))
+    return merged
+
+
+def _apply_base_url_override(target_url: str, base_url: str | None) -> str:
+    if not base_url:
+        return target_url
+
+    base = urlsplit(base_url)
+    if not base.scheme or not base.netloc:
+        return target_url
+
+    target = urlsplit(target_url)
+    path = target.path
+    if not path:
+        path = "/"
+    elif not path.startswith("/"):
+        path = "/" + path
+
+    return urlunsplit((base.scheme, base.netloc, path, target.query, target.fragment))
+
+
+def _db_load_scenario_to_model(db_scenario: DBLoadTestScenario) -> LoadTestScenario:
+    return LoadTestScenario(
+        id=db_scenario.id,
+        name=db_scenario.name,
+        description=db_scenario.description,
+        target_url=db_scenario.target_url,
+        method=db_scenario.method,
+        vus=db_scenario.vus,
+        duration=db_scenario.duration,
+        ramp_stages=db_scenario.ramp_stages_json or [],
+        thresholds=db_scenario.thresholds_json or {},
+        headers=db_scenario.headers_json or {},
+        query_params=db_scenario.query_params_json or {},
+        body=db_scenario.body_json,
+        expected_statuses=db_scenario.expected_statuses_json or [200],
+    )
+
+
+def _scenario_to_dict(scenario: LoadTestScenario, created_at: datetime | None = None) -> dict[str, Any]:
+    return {
+        "id": scenario.id,
+        "name": scenario.name,
+        "description": scenario.description,
+        "target_url": scenario.target_url,
+        "method": scenario.method.value if hasattr(scenario.method, "value") else str(scenario.method),
+        "vus": scenario.vus,
+        "duration": scenario.duration,
+        "ramp_stages": scenario.ramp_stages,
+        "thresholds": scenario.thresholds,
+        "headers": scenario.headers,
+        "query_params": scenario.query_params,
+        "body": scenario.body,
+        "expected_statuses": scenario.expected_statuses,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+
+
+def _db_load_result_to_dict(db_result: DBLoadTestResult, include_raw: bool = False) -> dict[str, Any]:
+    payload = {
+        "id": db_result.id,
+        "scenario_id": db_result.scenario_id,
+        "scenario_name": db_result.scenario_name,
+        "total_requests": db_result.total_requests,
+        "failed_requests": db_result.failed_requests,
+        "avg_response_time_ms": db_result.avg_response_time_ms,
+        "min_response_time_ms": db_result.min_response_time_ms,
+        "max_response_time_ms": db_result.max_response_time_ms,
+        "p50_ms": db_result.p50_ms,
+        "p90_ms": db_result.p90_ms,
+        "p95_ms": db_result.p95_ms,
+        "p99_ms": db_result.p99_ms,
+        "requests_per_second": db_result.requests_per_second,
+        "error_rate": db_result.error_rate,
+        "data_received_kb": db_result.data_received_kb,
+        "data_sent_kb": db_result.data_sent_kb,
+        "duration_seconds": db_result.duration_seconds,
+        "vus_max": db_result.vus_max,
+        "runner_status": db_result.runner_status or "passed",
+        "runner_message": db_result.runner_message or "",
+        "runner_exit_code": db_result.runner_exit_code,
+        "runner_stdout_excerpt": db_result.runner_stdout_excerpt or "",
+        "runner_stderr_excerpt": db_result.runner_stderr_excerpt or "",
+        "executed_at": db_result.executed_at.isoformat() if db_result.executed_at else None,
+    }
+    if include_raw:
+        payload["raw_metrics"] = db_result.raw_metrics or {}
+    return payload
+
+
+def _apply_load_preset(scenario: LoadTestScenario, preset: LoadTestPreset) -> LoadTestScenario:
+    config = load_test_preset_config(preset)
+    updated = scenario.model_copy(
+        update={
+            "vus": int(config.get("vus", scenario.vus)),
+            "duration": str(config.get("duration", scenario.duration)),
+            "ramp_stages": list(config.get("ramp_stages", scenario.ramp_stages)),
+            "thresholds": {
+                str(k): [str(v) for v in values]
+                for k, values in (config.get("thresholds", scenario.thresholds) or {}).items()
+            },
+        }
+    )
+    return updated
+
+
 @app.post("/api/loadtest/run")
 async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get_db)):
-    logger.info("loadtest.start scenario_ids=%s target_base_url=%s", req.scenario_ids, req.target_base_url)
+    logger.info(
+        "loadtest.start scenario_ids=%s target_base_url=%s profile_id=%s",
+        req.scenario_ids,
+        req.target_base_url,
+        req.profile_id,
+    )
     query = select(DBLoadTestScenario)
     latest_batch_created_at: datetime | None = None
     if req.scenario_ids:
@@ -416,26 +552,52 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
     if not db_scenarios:
         raise HTTPException(status_code=404, detail="No load test scenarios found")
 
+    selected_profile = None
+    profile_headers: dict[str, str] = {}
+    profile_base_url: str | None = None
+    if req.profile_id:
+        profiles = get_load_test_profiles()
+        selected_profile = next((profile for profile in profiles if profile.id == req.profile_id), None)
+        if not selected_profile:
+            raise HTTPException(status_code=404, detail=f"Load profile '{req.profile_id}' not found")
+        try:
+            profile_headers = resolve_profile_headers(selected_profile)
+        except LoadProfileResolutionError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Missing environment variables for load profile headers",
+                    "profile_id": e.profile_id,
+                    "missing_env_vars": e.missing_env_vars,
+                },
+            )
+        profile_base_url = selected_profile.base_url
+
+    override_headers = _coerce_headers(req.headers_override)
     all_metrics: list[LoadTestMetrics] = []
+    passed = 0
+    failed = 0
+    errors = 0
 
     for db_scenario in db_scenarios:
-        scenario = LoadTestScenario(
-            id=db_scenario.id,
-            name=db_scenario.name,
-            description=db_scenario.description,
-            target_url=db_scenario.target_url.replace(
-                "http://localhost:8080", req.target_base_url
-            ) if req.target_base_url != "http://localhost:8080" else db_scenario.target_url,
-            method=db_scenario.method,
-            vus=db_scenario.vus,
-            duration=db_scenario.duration,
-            ramp_stages=db_scenario.ramp_stages_json or [],
-            thresholds=db_scenario.thresholds_json or {},
-            headers=db_scenario.headers_json or {},
+        scenario = _db_load_scenario_to_model(db_scenario)
+        effective_base_url = req.target_base_url or profile_base_url
+        scenario = scenario.model_copy(
+            update={
+                "target_url": _apply_base_url_override(scenario.target_url, effective_base_url),
+                "headers": _merge_headers(scenario.headers, profile_headers, override_headers),
+            }
         )
 
         metrics = run_k6_test(scenario)
         all_metrics.append(metrics)
+
+        if metrics.runner_status == "passed":
+            passed += 1
+        elif metrics.runner_status == "failed":
+            failed += 1
+        else:
+            errors += 1
 
         db_result = DBLoadTestResult(
             id=metrics.id,
@@ -456,6 +618,11 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
             data_sent_kb=metrics.data_sent_kb,
             duration_seconds=metrics.duration_seconds,
             vus_max=metrics.vus_max,
+            runner_status=metrics.runner_status,
+            runner_message=metrics.runner_message,
+            runner_exit_code=metrics.runner_exit_code,
+            runner_stdout_excerpt=metrics.runner_stdout_excerpt,
+            runner_stderr_excerpt=metrics.runner_stderr_excerpt,
             raw_metrics=metrics.raw_metrics,
         )
         db.add(db_result)
@@ -465,7 +632,11 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
 
     return {
         "batch_created_at": latest_batch_created_at.isoformat() if latest_batch_created_at else None,
+        "profile_id": selected_profile.id if selected_profile else None,
         "total_scenarios": len(all_metrics),
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
         "results": [m.model_dump() for m in all_metrics],
     }
 
@@ -888,6 +1059,7 @@ async def get_result(result_id: str, db: AsyncSession = Depends(get_db)):
 async def list_load_test_results(
     scenario_id: str | None = None,
     limit: int = Query(default=50, le=200),
+    include_raw: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
 ):
     query = select(DBLoadTestResult)
@@ -898,30 +1070,20 @@ async def list_load_test_results(
     result = await db.execute(query)
     results = result.scalars().all()
 
-    return [
-        {
-            "id": r.id,
-            "scenario_id": r.scenario_id,
-            "scenario_name": r.scenario_name,
-            "total_requests": r.total_requests,
-            "failed_requests": r.failed_requests,
-            "avg_response_time_ms": r.avg_response_time_ms,
-            "min_response_time_ms": r.min_response_time_ms,
-            "max_response_time_ms": r.max_response_time_ms,
-            "p50_ms": r.p50_ms,
-            "p90_ms": r.p90_ms,
-            "p95_ms": r.p95_ms,
-            "p99_ms": r.p99_ms,
-            "requests_per_second": r.requests_per_second,
-            "error_rate": r.error_rate,
-            "data_received_kb": r.data_received_kb,
-            "data_sent_kb": r.data_sent_kb,
-            "duration_seconds": r.duration_seconds,
-            "vus_max": r.vus_max,
-            "executed_at": r.executed_at.isoformat() if r.executed_at else None,
-        }
-        for r in results
-    ]
+    return [_db_load_result_to_dict(r, include_raw=include_raw) for r in results]
+
+
+@app.get("/api/loadtest/results/{result_id}")
+async def get_load_test_result(
+    result_id: str,
+    include_raw: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DBLoadTestResult).where(DBLoadTestResult.id == result_id))
+    db_result = result.scalar_one_or_none()
+    if not db_result:
+        raise HTTPException(status_code=404, detail="Load test result not found")
+    return _db_load_result_to_dict(db_result, include_raw=include_raw)
 
 
 @app.get("/api/loadtest/scenarios")
@@ -939,21 +1101,125 @@ async def list_load_test_scenarios(
     result = await db.execute(query.order_by(DBLoadTestScenario.created_at.desc()))
     scenarios = result.scalars().all()
 
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "description": s.description,
-            "target_url": s.target_url,
-            "method": s.method,
-            "vus": s.vus,
-            "duration": s.duration,
-            "ramp_stages": s.ramp_stages_json,
-            "thresholds": s.thresholds_json,
-            "created_at": s.created_at.isoformat() if s.created_at else None,
-        }
-        for s in scenarios
-    ]
+    return [_scenario_to_dict(_db_load_scenario_to_model(s), s.created_at) for s in scenarios]
+
+
+@app.post("/api/loadtest/scenarios")
+async def create_load_test_scenario(
+    req: LoadTestScenarioUpsertRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    scenario = LoadTestScenario(
+        id=req.id,
+        name=req.name,
+        description=req.description,
+        target_url=req.target_url,
+        method=req.method,
+        vus=req.vus,
+        duration=req.duration,
+        ramp_stages=req.ramp_stages,
+        thresholds=req.thresholds,
+        headers=req.headers,
+        query_params=req.query_params,
+        body=req.body,
+        expected_statuses=req.expected_statuses,
+    )
+    if req.preset is not None:
+        scenario = _apply_load_preset(scenario, req.preset)
+
+    scenario_id = str(uuid.uuid4())
+    created_at = datetime.utcnow()
+    db_scenario = DBLoadTestScenario(
+        id=scenario_id,
+        name=scenario.name,
+        description=scenario.description,
+        target_url=scenario.target_url,
+        method=scenario.method.value if hasattr(scenario.method, "value") else str(scenario.method),
+        vus=scenario.vus,
+        duration=scenario.duration,
+        ramp_stages_json=scenario.ramp_stages,
+        thresholds_json=scenario.thresholds,
+        headers_json=scenario.headers,
+        query_params_json=scenario.query_params,
+        body_json=scenario.body,
+        expected_statuses_json=scenario.expected_statuses,
+        created_at=created_at,
+    )
+    db.add(db_scenario)
+    await db.commit()
+    await db.refresh(db_scenario)
+    return _scenario_to_dict(_db_load_scenario_to_model(db_scenario), db_scenario.created_at)
+
+
+@app.put("/api/loadtest/scenarios/{scenario_id}")
+async def update_load_test_scenario(
+    scenario_id: str,
+    req: LoadTestScenarioUpsertRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DBLoadTestScenario).where(DBLoadTestScenario.id == scenario_id))
+    db_scenario = result.scalar_one_or_none()
+    if not db_scenario:
+        raise HTTPException(status_code=404, detail="Load test scenario not found")
+    if req.id and req.id != scenario_id:
+        raise HTTPException(status_code=400, detail="Scenario ID in payload does not match path")
+
+    scenario = LoadTestScenario(
+        id=scenario_id,
+        name=req.name,
+        description=req.description,
+        target_url=req.target_url,
+        method=req.method,
+        vus=req.vus,
+        duration=req.duration,
+        ramp_stages=req.ramp_stages,
+        thresholds=req.thresholds,
+        headers=req.headers,
+        query_params=req.query_params,
+        body=req.body,
+        expected_statuses=req.expected_statuses,
+    )
+    if req.preset is not None:
+        scenario = _apply_load_preset(scenario, req.preset)
+
+    db_scenario.name = scenario.name
+    db_scenario.description = scenario.description
+    db_scenario.target_url = scenario.target_url
+    db_scenario.method = scenario.method.value if hasattr(scenario.method, "value") else str(scenario.method)
+    db_scenario.vus = scenario.vus
+    db_scenario.duration = scenario.duration
+    db_scenario.ramp_stages_json = scenario.ramp_stages
+    db_scenario.thresholds_json = scenario.thresholds
+    db_scenario.headers_json = scenario.headers
+    db_scenario.query_params_json = scenario.query_params
+    db_scenario.body_json = scenario.body
+    db_scenario.expected_statuses_json = scenario.expected_statuses
+    await db.commit()
+    await db.refresh(db_scenario)
+    return _scenario_to_dict(_db_load_scenario_to_model(db_scenario), db_scenario.created_at)
+
+
+@app.delete("/api/loadtest/scenarios/{scenario_id}")
+async def delete_load_test_scenario(
+    scenario_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(DBLoadTestScenario).where(DBLoadTestScenario.id == scenario_id))
+    db_scenario = result.scalar_one_or_none()
+    if not db_scenario:
+        raise HTTPException(status_code=404, detail="Load test scenario not found")
+    await db.delete(db_scenario)
+    await db.commit()
+    return {"id": scenario_id, "deleted": True}
+
+
+@app.get("/api/loadtest/profiles")
+async def list_load_test_profiles():
+    profiles = get_load_test_profiles()
+    return {
+        "profiles": [profile.model_dump(mode="json") for profile in profiles],
+        "presets": get_all_load_test_presets(),
+    }
 
 
 def _count_suite_tests(suites_json: list[dict[str, Any]] | None) -> int:
