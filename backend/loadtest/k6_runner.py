@@ -17,6 +17,18 @@ def _excerpt(text: str, limit: int = 2000) -> str:
     return text[:limit] + "...(truncated)"
 
 
+def _metric_values(metrics: dict, metric_name: str) -> dict:
+    metric = metrics.get(metric_name, {})
+    if not isinstance(metric, dict):
+        return {}
+    values = metric.get("values")
+    if isinstance(values, dict):
+        return values
+    # Some k6 summary formats expose metric values at the top level instead of
+    # under a "values" object.
+    return {k: v for k, v in metric.items() if isinstance(v, (int, float))}
+
+
 def _parse_k6_summary(summary_path: str) -> dict:
     """Parse the k6 JSON summary output file."""
     with open(summary_path, "r") as f:
@@ -24,18 +36,42 @@ def _parse_k6_summary(summary_path: str) -> dict:
 
     metrics = data.get("metrics", {})
 
-    http_req_duration = metrics.get("http_req_duration", {}).get("values", {})
-    http_reqs = metrics.get("http_reqs", {}).get("values", {})
-    http_req_failed = metrics.get("http_req_failed", {}).get("values", {})
-    data_received = metrics.get("data_received", {}).get("values", {})
-    data_sent = metrics.get("data_sent", {}).get("values", {})
-    vus_max = metrics.get("vus_max", {}).get("values", {})
+    http_req_duration = _metric_values(metrics, "http_req_duration")
+    http_reqs = _metric_values(metrics, "http_reqs")
+    http_req_failed = _metric_values(metrics, "http_req_failed")
+    data_received = _metric_values(metrics, "data_received")
+    data_sent = _metric_values(metrics, "data_sent")
+    vus_max = _metric_values(metrics, "vus_max")
+    iterations = _metric_values(metrics, "iterations")
+    custom_errors = _metric_values(metrics, "errors")
 
-    failed_requests = http_req_failed.get("fails")
-    if failed_requests is None:
-        rate = float(http_req_failed.get("rate", 0) or 0)
-        total_count = int(http_reqs.get("count", 0) or 0)
-        failed_requests = int(round(rate * total_count))
+    total_requests = int(http_reqs.get("count", 0) or 0)
+    if total_requests <= 0:
+        # Fallback for summaries where http_reqs is missing but iterations exists.
+        total_requests = int(iterations.get("count", 0) or 0)
+
+    # Prefer error rate/value for failed-request estimation because some k6
+    # summary formats expose "passes/fails" counters for the metric internals
+    # (not direct failed HTTP request counts).
+    error_rate = float(http_req_failed.get("rate", http_req_failed.get("value", 0)) or 0)
+    failed_requests = int(round(error_rate * total_requests))
+
+    # Legacy fallback where only absolute fails count is available.
+    if failed_requests == 0:
+        has_passes = "passes" in http_req_failed
+        fails_count = http_req_failed.get("fails")
+        if fails_count is not None and not has_passes:
+            failed_requests = int(fails_count or 0)
+
+    if (not failed_requests) and total_requests > 0:
+        custom_error_rate = float(custom_errors.get("value", custom_errors.get("rate", 0)) or 0)
+        if custom_error_rate > 0:
+            failed_requests = int(round(custom_error_rate * total_requests))
+            if error_rate == 0:
+                error_rate = custom_error_rate
+
+    if error_rate == 0:
+        error_rate = float(custom_errors.get("value", custom_errors.get("rate", 0)) or 0)
 
     return {
         "avg_response_time_ms": http_req_duration.get("avg", 0),
@@ -45,10 +81,10 @@ def _parse_k6_summary(summary_path: str) -> dict:
         "p90_ms": http_req_duration.get("p(90)", 0),
         "p95_ms": http_req_duration.get("p(95)", 0),
         "p99_ms": http_req_duration.get("p(99)", 0),
-        "total_requests": int(http_reqs.get("count", 0)),
-        "requests_per_second": http_reqs.get("rate", 0),
+        "total_requests": total_requests,
+        "requests_per_second": http_reqs.get("rate", iterations.get("rate", 0)),
         "failed_requests": int(failed_requests or 0),
-        "error_rate": http_req_failed.get("rate", 0),
+        "error_rate": error_rate,
         "data_received_kb": data_received.get("count", 0) / 1024,
         "data_sent_kb": data_sent.get("count", 0) / 1024,
         "vus_max": int(vus_max.get("max", 0)),
@@ -93,10 +129,16 @@ def run_k6_test(scenario: LoadTestScenario) -> LoadTestMetrics:
             }
             raw_metrics = {"stdout": result.stdout, "stderr": result.stderr}
 
+        stderr_lower = (result.stderr or "").lower()
+        threshold_failure = "thresholds on metrics" in stderr_lower
+
         if return_code == 0:
             runner_status = "passed"
             runner_message = "k6 completed successfully"
-        elif has_summary and parsed.get("total_requests", 0):
+        elif has_summary and threshold_failure:
+            runner_status = "failed"
+            runner_message = f"k6 thresholds crossed (exit code {return_code})"
+        elif has_summary:
             runner_status = "failed"
             runner_message = f"k6 completed with non-zero exit code {return_code}"
         else:
