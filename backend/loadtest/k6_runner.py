@@ -17,16 +17,19 @@ def _excerpt(text: str, limit: int = 2000) -> str:
     return text[:limit] + "...(truncated)"
 
 
-def _metric_values(metrics: dict, metric_name: str) -> dict:
+def _metric_values(metrics: dict, metric_name: str) -> tuple[dict, str]:
     metric = metrics.get(metric_name, {})
     if not isinstance(metric, dict):
-        return {}
+        return {}, "missing"
     values = metric.get("values")
     if isinstance(values, dict):
-        return values
+        return values, "values"
     # Some k6 summary formats expose metric values at the top level instead of
     # under a "values" object.
-    return {k: v for k, v in metric.items() if isinstance(v, (int, float))}
+    flat = {k: v for k, v in metric.items() if isinstance(v, (int, float))}
+    if flat:
+        return flat, "flat"
+    return {}, "missing"
 
 
 def _parse_k6_summary(summary_path: str) -> dict:
@@ -36,24 +39,41 @@ def _parse_k6_summary(summary_path: str) -> dict:
 
     metrics = data.get("metrics", {})
 
-    http_req_duration = _metric_values(metrics, "http_req_duration")
-    http_reqs = _metric_values(metrics, "http_reqs")
-    http_req_failed = _metric_values(metrics, "http_req_failed")
-    data_received = _metric_values(metrics, "data_received")
-    data_sent = _metric_values(metrics, "data_sent")
-    vus_max = _metric_values(metrics, "vus_max")
-    iterations = _metric_values(metrics, "iterations")
-    custom_errors = _metric_values(metrics, "errors")
+    http_req_duration, duration_shape = _metric_values(metrics, "http_req_duration")
+    http_reqs, http_reqs_shape = _metric_values(metrics, "http_reqs")
+    http_req_failed, _failed_shape = _metric_values(metrics, "http_req_failed")
+    data_received, _received_shape = _metric_values(metrics, "data_received")
+    data_sent, _sent_shape = _metric_values(metrics, "data_sent")
+    vus_max, _vus_shape = _metric_values(metrics, "vus_max")
+    iterations, iterations_shape = _metric_values(metrics, "iterations")
+    custom_errors, _errors_shape = _metric_values(metrics, "errors")
+
+    parse_warnings: list[str] = []
+    metric_shape = http_reqs_shape if http_reqs_shape != "missing" else (
+        iterations_shape if iterations_shape != "missing" else duration_shape
+    )
 
     total_requests = int(http_reqs.get("count", 0) or 0)
+    request_count_source = "http_reqs.count"
     if total_requests <= 0:
         # Fallback for summaries where http_reqs is missing but iterations exists.
         total_requests = int(iterations.get("count", 0) or 0)
+        request_count_source = "iterations.count" if total_requests > 0 else "none"
+    if total_requests <= 0:
+        parse_warnings.append("no_request_count_metric")
 
     # Prefer error rate/value for failed-request estimation because some k6
     # summary formats expose "passes/fails" counters for the metric internals
     # (not direct failed HTTP request counts).
-    error_rate = float(http_req_failed.get("rate", http_req_failed.get("value", 0)) or 0)
+    error_rate_source = "none"
+    if "rate" in http_req_failed:
+        error_rate = float(http_req_failed.get("rate", 0) or 0)
+        error_rate_source = "http_req_failed.rate"
+    elif "value" in http_req_failed:
+        error_rate = float(http_req_failed.get("value", 0) or 0)
+        error_rate_source = "http_req_failed.value"
+    else:
+        error_rate = 0.0
     failed_requests = int(round(error_rate * total_requests))
 
     # Legacy fallback where only absolute fails count is available.
@@ -69,9 +89,15 @@ def _parse_k6_summary(summary_path: str) -> dict:
             failed_requests = int(round(custom_error_rate * total_requests))
             if error_rate == 0:
                 error_rate = custom_error_rate
+                error_rate_source = "errors.value_or_rate"
 
     if error_rate == 0:
-        error_rate = float(custom_errors.get("value", custom_errors.get("rate", 0)) or 0)
+        fallback_error_rate = float(custom_errors.get("value", custom_errors.get("rate", 0)) or 0)
+        if fallback_error_rate > 0:
+            error_rate = fallback_error_rate
+            error_rate_source = "errors.value_or_rate"
+    if error_rate_source == "none":
+        parse_warnings.append("no_error_rate_metric")
 
     return {
         "avg_response_time_ms": http_req_duration.get("avg", 0),
@@ -88,6 +114,12 @@ def _parse_k6_summary(summary_path: str) -> dict:
         "data_received_kb": data_received.get("count", 0) / 1024,
         "data_sent_kb": data_sent.get("count", 0) / 1024,
         "vus_max": int(vus_max.get("max", 0)),
+        "parse_diagnostics": {
+            "metric_shape": metric_shape,
+            "request_count_source": request_count_source,
+            "error_rate_source": error_rate_source,
+            "parse_warnings": parse_warnings,
+        },
         "raw_metrics": data,
     }
 
@@ -117,7 +149,10 @@ def run_k6_test(scenario: LoadTestScenario) -> LoadTestMetrics:
         has_summary = os.path.exists(summary_path) and os.path.getsize(summary_path) > 0
         if has_summary:
             parsed = _parse_k6_summary(summary_path)
+            parse_diagnostics = parsed.get("parse_diagnostics", {})
             raw_metrics = parsed.get("raw_metrics", {})
+            if parse_diagnostics:
+                raw_metrics = {**raw_metrics, "_parser": parse_diagnostics}
         else:
             parsed = {
                 "avg_response_time_ms": 0, "min_response_time_ms": 0,
@@ -126,8 +161,19 @@ def run_k6_test(scenario: LoadTestScenario) -> LoadTestMetrics:
                 "requests_per_second": 0, "failed_requests": 0,
                 "error_rate": 0, "data_received_kb": 0, "data_sent_kb": 0,
                 "vus_max": 0,
+                "parse_diagnostics": {
+                    "metric_shape": None,
+                    "request_count_source": "none",
+                    "error_rate_source": "none",
+                    "parse_warnings": ["missing_summary_export"],
+                },
             }
-            raw_metrics = {"stdout": result.stdout, "stderr": result.stderr}
+            parse_diagnostics = parsed["parse_diagnostics"]
+            raw_metrics = {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "_parser": parse_diagnostics,
+            }
 
         stderr_lower = (result.stderr or "").lower()
         threshold_failure = "thresholds on metrics" in stderr_lower
@@ -169,6 +215,10 @@ def run_k6_test(scenario: LoadTestScenario) -> LoadTestMetrics:
             runner_exit_code=return_code,
             runner_stdout_excerpt=stdout_excerpt,
             runner_stderr_excerpt=stderr_excerpt,
+            metric_shape=parse_diagnostics.get("metric_shape"),
+            request_count_source=parse_diagnostics.get("request_count_source"),
+            error_rate_source=parse_diagnostics.get("error_rate_source"),
+            parse_warnings=list(parse_diagnostics.get("parse_warnings") or []),
             raw_metrics=raw_metrics,
         )
 
@@ -182,6 +232,10 @@ def run_k6_test(scenario: LoadTestScenario) -> LoadTestMetrics:
             runner_exit_code=None,
             runner_stdout_excerpt=_excerpt(str(exc.stdout or "")),
             runner_stderr_excerpt=_excerpt(str(exc.stderr or "")),
+            metric_shape=None,
+            request_count_source="none",
+            error_rate_source="none",
+            parse_warnings=["timeout"],
             raw_metrics={
                 "error": "k6 test timed out after 600 seconds",
                 "stdout": str(exc.stdout or ""),
@@ -195,6 +249,10 @@ def run_k6_test(scenario: LoadTestScenario) -> LoadTestMetrics:
             scenario_name=scenario.name,
             runner_status="error",
             runner_message="k6 is not installed. Install it with: brew install k6",
+            metric_shape=None,
+            request_count_source="none",
+            error_rate_source="none",
+            parse_warnings=["k6_not_installed"],
             raw_metrics={"error": "k6 is not installed. Install it with: brew install k6"},
         )
     finally:

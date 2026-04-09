@@ -118,6 +118,37 @@ def _planner_output_json() -> str:
     return json.dumps(payload)
 
 
+def _executor_output_json(
+    *,
+    scenario_id: str = "load_1",
+    include_unknown_load_id: bool = False,
+) -> str:
+    load_enrichments = [
+        {
+            "scenario_id": scenario_id,
+            "target_url": "/pets?status=available",
+            "method": "GET",
+            "vus": 25,
+            "duration": "45s",
+            "thresholds": {"http_req_duration": ["p(95)<1500"]},
+            "headers": {"X-Load-Enriched": "yes"},
+        }
+    ]
+    if include_unknown_load_id:
+        load_enrichments.append(
+            {
+                "scenario_id": "unknown_scenario",
+                "target_url": "/ghost",
+            }
+        )
+    payload = {
+        "test_enrichments": [],
+        "load_enrichments": load_enrichments,
+        "websocket_tests": [],
+    }
+    return json.dumps(payload)
+
+
 def _all_cases(suites: list) -> list:
     return [test_case for suite in suites for test_case in suite.test_cases]
 
@@ -179,7 +210,10 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
 
         with (
             patch("generator.gemini_generator._get_client", return_value=object()),
-            patch("generator.gemini_generator._call_model_text", side_effect=[_planner_output_json()]),
+            patch(
+                "generator.gemini_generator._call_model_text",
+                side_effect=[_planner_output_json(), _executor_output_json()],
+            ),
             patch("generator.gemini_generator._executor_call_for_case", new=fake_executor_call),
         ):
             suites, load_scenarios, generation_meta = await generate_all(
@@ -193,6 +227,9 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(_all_cases(suites)), 2)
         from_executor_markers = {case.query_params.get("from_executor") for case in _all_cases(suites)}
         self.assertEqual(from_executor_markers, {"case_ind_1", "case_suite_1"})
+        self.assertEqual(load_scenarios[0].target_url, "https://example.com/api/v1/pets?status=available")
+        self.assertEqual(load_scenarios[0].vus, 25)
+        self.assertEqual(load_scenarios[0].headers.get("X-Load-Enriched"), "yes")
         self.assertEqual(generation_meta.dropped_items_count, 0)
         self.assertEqual(generation_meta.executor_jobs_total, 2)
         self.assertEqual(generation_meta.executor_jobs_succeeded, 2)
@@ -205,6 +242,32 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
         self.assertEqual(capture.executor_case_outcomes["case_ind_1"]["status"], "succeeded")
         self.assertEqual(len(capture.final_suites), 2)
         self.assertEqual(capture.generation_meta.get("executor_jobs_total"), 2)
+
+    async def test_generate_all_load_enrichment_unknown_id_is_dropped(self) -> None:
+        parsed = _parsed_api()
+
+        with (
+            patch("generator.gemini_generator._get_client", return_value=object()),
+            patch(
+                "generator.gemini_generator._call_model_text",
+                side_effect=[
+                    _planner_output_json(),
+                    _executor_output_json(include_unknown_load_id=True),
+                ],
+            ),
+        ):
+            suites, load_scenarios, generation_meta = await generate_all(
+                parsed,
+                [TestCategory.LOAD],
+            )
+
+        self.assertEqual(len(suites), 0)
+        self.assertEqual(len(load_scenarios), 1)
+        self.assertEqual(load_scenarios[0].target_url, "https://example.com/api/v1/pets?status=available")
+        self.assertEqual(load_scenarios[0].duration, "45s")
+        self.assertEqual(load_scenarios[0].headers.get("X-Load-Enriched"), "yes")
+        self.assertEqual(generation_meta.executor_jobs_total, 0)
+        self.assertEqual(generation_meta.dropped_items_count, 1)
 
     async def test_generate_all_per_case_structured_failure_uses_fallback(self) -> None:
         parsed = _parsed_api()

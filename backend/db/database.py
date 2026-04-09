@@ -1,7 +1,11 @@
+from pathlib import Path
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import text
 
-DATABASE_URL = "sqlite+aiosqlite:///./agentic_tests.db"
+_BACKEND_DIR = Path(__file__).resolve().parents[1]
+DATABASE_PATH = _BACKEND_DIR / "agentic_tests.db"
+DATABASE_URL = f"sqlite+aiosqlite:///{DATABASE_PATH}"
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -31,6 +35,10 @@ async def init_db():
                 ("runner_exit_code", "INTEGER"),
                 ("runner_stdout_excerpt", "TEXT DEFAULT ''"),
                 ("runner_stderr_excerpt", "TEXT DEFAULT ''"),
+                ("metric_shape", "VARCHAR"),
+                ("request_count_source", "VARCHAR"),
+                ("error_rate_source", "VARCHAR"),
+                ("parse_warnings_json", "JSON DEFAULT '[]'"),
             ],
         }
 

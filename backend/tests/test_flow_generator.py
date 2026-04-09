@@ -9,7 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from flows.generator import _build_dependency_hints, _flow_quality_errors, _infer_objectives, generate_flows  # noqa: E402
+from flows.generator import (  # noqa: E402
+    _build_dependency_hints,
+    _flow_quality_errors,
+    _infer_objectives,
+    _llm_compose_flows,
+    generate_flows,
+)
 from models.schemas import (  # noqa: E402
     FlowGenerateRequest,
     FlowGenerationMode,
@@ -62,7 +68,7 @@ paths:
 
         with (
             patch("flows.generator.GEMINI_API_KEY", "key"),
-            patch("flows.generator._llm_refine_flows", return_value=[llm_flow]),
+            patch("flows.generator._llm_refine_flows", return_value=([llm_flow], 3)),
         ):
             flows, summary = await generate_flows(parsed_api, req, "gen-1")
 
@@ -70,6 +76,8 @@ paths:
         self.assertEqual(flows[0].name, "LLM Flow")
         self.assertEqual(summary["source"], "llm_refined")
         self.assertFalse(summary["fallback_used"])
+        self.assertTrue(summary["llm_attempted"])
+        self.assertEqual(summary["llm_normalizations_applied"], 3)
 
     async def test_generate_flows_falls_back_when_llm_invalid(self) -> None:
         parsed_api = parse_openapi(
@@ -110,6 +118,8 @@ paths:
         self.assertGreaterEqual(len(flows), 1)
         self.assertEqual(summary["source"], "deterministic_fallback")
         self.assertTrue(summary["fallback_used"])
+        self.assertTrue(summary["llm_attempted"])
+        self.assertEqual(summary["llm_normalizations_applied"], 0)
 
     def test_dependency_hints_include_openapi_links_and_param_hints(self) -> None:
         parsed_api = parse_openapi(
@@ -316,3 +326,163 @@ paths:
             for flow in flows
         )
         self.assertTrue(has_login or has_auth_header)
+
+    async def test_llm_compose_normalizes_legacy_extract_schema(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Normalize API
+  version: "1.0"
+servers:
+  - url: https://example.com
+paths:
+  /status:
+    get:
+      responses:
+        "200":
+          description: ok
+"""
+        )
+        req = FlowGenerateRequest()
+        llm_payload = {
+            "flows": [
+                {
+                    "name": "Legacy flow",
+                    "description": "legacy extract schema",
+                    "persona": "tester",
+                    "preconditions": [],
+                    "tags": ["legacy"],
+                    "steps": [
+                        {
+                            "step_id": "step1",
+                            "order": 1,
+                            "name": "Status",
+                            "method": "GET",
+                            "endpoint": "/status",
+                            "extract": [
+                                {
+                                    "key": "api_status",
+                                    "json_path": "$.status",
+                                    "required": "false",
+                                }
+                            ],
+                            "assertions": [{"field": "status_code", "operator": "eq", "expected": 200}],
+                            "expected_status": 200,
+                            "required": True,
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with patch("flows.generator._llm_json_call", return_value=llm_payload):
+            flows, normalizations = await _llm_compose_flows(
+                client=object(),
+                parsed_api=parsed_api,
+                req=req,
+                objectives=["health"],
+                seed_flows=[],
+                scenarios=[{"name": "legacy"}],
+                dependency_hints=[],
+            )
+
+        self.assertEqual(len(flows), 1)
+        self.assertGreater(normalizations, 0)
+        extract = flows[0].steps[0].extract[0]
+        self.assertEqual(extract.var, "api_status")
+        self.assertEqual(extract.source.value, "body")
+        self.assertEqual(extract.path, "status")
+        self.assertFalse(extract.required)
+
+    async def test_include_negative_adds_negative_step_when_feasible(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Negative API
+  version: "1.0"
+servers:
+  - url: https://example.com
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+paths:
+  /auth/login:
+    post:
+      summary: Login
+      responses:
+        "200":
+          description: ok
+  /private/posts:
+    get:
+      security:
+        - bearerAuth: []
+      summary: List private posts
+      responses:
+        "200":
+          description: ok
+        "401":
+          description: unauthorized
+"""
+        )
+        req = FlowGenerateRequest(
+            generation_mode=FlowGenerationMode.DETERMINISTIC_FIRST,
+            include_negative=True,
+            max_flows=2,
+            max_steps_per_flow=6,
+        )
+
+        flows, summary = await generate_flows(parsed_api, req, "neg-gen-1")
+        self.assertGreaterEqual(len(flows), 1)
+        self.assertEqual(summary["negative_flows_added"], 1)
+        self.assertIsNone(summary["negative_generation_skipped_reason"])
+        self.assertTrue(
+            any(
+                any((not step.required) and step.name.lower().startswith("negative") for step in flow.steps)
+                for flow in flows
+            )
+        )
+
+    async def test_include_negative_reports_skip_reason_when_infeasible(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Public API
+  version: "1.0"
+servers:
+  - url: https://example.com
+paths:
+  /posts:
+    get:
+      responses:
+        "200":
+          description: ok
+  /posts/{postId}:
+    get:
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+"""
+        )
+        req = FlowGenerateRequest(
+            generation_mode=FlowGenerationMode.DETERMINISTIC_FIRST,
+            include_negative=True,
+            max_flows=2,
+            max_steps_per_flow=5,
+        )
+
+        _flows, summary = await generate_flows(parsed_api, req, "neg-gen-2")
+        self.assertEqual(summary["negative_flows_added"], 0)
+        self.assertEqual(
+            summary["negative_generation_skipped_reason"],
+            "no_auth_or_validation_negative_pattern",
+        )

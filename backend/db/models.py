@@ -106,6 +106,10 @@ class DBLoadTestResult(Base):
     runner_exit_code = Column(Integer, nullable=True)
     runner_stdout_excerpt = Column(Text, default="")
     runner_stderr_excerpt = Column(Text, default="")
+    metric_shape = Column(String, nullable=True)
+    request_count_source = Column(String, nullable=True)
+    error_rate_source = Column(String, nullable=True)
+    parse_warnings_json = Column(JSON, default=list)
     raw_metrics = Column(JSON, default=dict)
     executed_at = Column(DateTime, default=datetime.utcnow)
 

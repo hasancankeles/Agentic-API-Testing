@@ -533,6 +533,16 @@ def _compose_target_url(base_url: str, endpoint: str) -> str:
     return f"http://localhost:8080{normalized_endpoint}"
 
 
+def _normalize_load_target_url(target_url: str, base_url: str) -> str:
+    raw = (target_url or "").strip()
+    if not raw:
+        return raw
+    if raw.startswith(("http://", "https://")):
+        return raw
+    endpoint = raw if raw.startswith("/") else f"/{raw}"
+    return _compose_target_url(base_url, endpoint)
+
+
 def _normalize_assertion_field(field: str) -> str:
     raw = field.strip()
     if not raw:
@@ -971,9 +981,13 @@ def _apply_test_enrichment(test_case: TestCase, enrichment: ExecutorTestEnrichme
         test_case.assertions = _normalize_assertions(list(enrichment.assertions))
 
 
-def _apply_load_enrichment(scenario: LoadTestScenario, enrichment: ExecutorLoadEnrichment) -> None:
+def _apply_load_enrichment(
+    scenario: LoadTestScenario,
+    enrichment: ExecutorLoadEnrichment,
+    base_url: str,
+) -> None:
     if enrichment.target_url:
-        scenario.target_url = str(enrichment.target_url)
+        scenario.target_url = _normalize_load_target_url(str(enrichment.target_url), base_url)
     if enrichment.method is not None:
         scenario.method = enrichment.method
     if enrichment.vus is not None:
@@ -1071,18 +1085,31 @@ async def materialize_tests(
         if debug_capture is not None:
             debug_capture.set_case_outcomes(queue_result.case_outcomes)
 
-    # Keep existing websocket behavior as a best-effort enrichment path.
-    if parsed_api.websocket_messages and TestCategory.SUITE in category_set and suites:
+    executor_output = ExecutorOutput()
+    should_fetch_executor_output = bool(load_lookup) or (
+        parsed_api.websocket_messages and TestCategory.SUITE in category_set and suites
+    )
+    if should_fetch_executor_output:
         try:
-            executor_output, ws_repair_attempted = await _executor_output(
+            executor_output, ws_or_load_repair_attempted = await _executor_output(
                 plan,
                 parsed_api,
                 raw_output_observer=debug_capture.record_raw_output if debug_capture else None,
             )
-            repair_attempted = repair_attempted or ws_repair_attempted
+            repair_attempted = repair_attempted or ws_or_load_repair_attempted
         except Exception:
             executor_output = ExecutorOutput()
 
+    if load_lookup:
+        for load_enrichment in executor_output.load_enrichments:
+            target_scenario = load_lookup.get(load_enrichment.scenario_id)
+            if not target_scenario:
+                dropped_items_count += 1
+                continue
+            _apply_load_enrichment(target_scenario, load_enrichment, parsed_api.base_url)
+
+    # Keep existing websocket behavior as a best-effort enrichment path.
+    if parsed_api.websocket_messages and TestCategory.SUITE in category_set and suites:
         for ws_draft in executor_output.websocket_tests:
             target_suite = suite_lookup.get(ws_draft.suite_id)
             if not target_suite:

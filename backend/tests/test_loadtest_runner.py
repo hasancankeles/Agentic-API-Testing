@@ -68,6 +68,10 @@ class LoadTestRunnerTests(TestCase):
         self.assertEqual(metrics.runner_exit_code, 1)
         self.assertEqual(metrics.total_requests, 100)
         self.assertEqual(metrics.failed_requests, 2)
+        self.assertEqual(metrics.metric_shape, "values")
+        self.assertEqual(metrics.request_count_source, "http_reqs.count")
+        self.assertEqual(metrics.error_rate_source, "http_req_failed.rate")
+        self.assertEqual(metrics.parse_warnings, [])
 
     def test_threshold_breach_with_summary_uses_failed_status_and_iteration_fallback(self) -> None:
         scenario = _sample_scenario()
@@ -116,6 +120,8 @@ class LoadTestRunnerTests(TestCase):
         self.assertEqual(metrics.total_requests, 1130)
         self.assertEqual(metrics.failed_requests, 1130)
         self.assertEqual(metrics.requests_per_second, 37.4)
+        self.assertEqual(metrics.request_count_source, "iterations.count")
+        self.assertEqual(metrics.error_rate_source, "http_req_failed.rate")
 
     def test_flat_metric_shape_uses_value_rate_not_fails_counter(self) -> None:
         scenario = _sample_scenario()
@@ -160,6 +166,10 @@ class LoadTestRunnerTests(TestCase):
         self.assertAlmostEqual(metrics.requests_per_second, 3.279761086300602)
         self.assertEqual(metrics.failed_requests, 0)
         self.assertEqual(metrics.error_rate, 0)
+        self.assertEqual(metrics.metric_shape, "flat")
+        self.assertEqual(metrics.request_count_source, "http_reqs.count")
+        self.assertEqual(metrics.error_rate_source, "http_req_failed.value")
+        self.assertEqual(metrics.parse_warnings, [])
 
     def test_timeout_returns_structured_error(self) -> None:
         scenario = _sample_scenario()
@@ -179,6 +189,8 @@ class LoadTestRunnerTests(TestCase):
         self.assertEqual(metrics.runner_status, "error")
         self.assertIn("timed out", metrics.runner_message)
         self.assertIn("timeout stdout", metrics.raw_metrics.get("stdout", ""))
+        self.assertEqual(metrics.request_count_source, "none")
+        self.assertEqual(metrics.parse_warnings, ["timeout"])
 
     def test_missing_k6_binary_returns_structured_error(self) -> None:
         scenario = _sample_scenario()
@@ -191,3 +203,5 @@ class LoadTestRunnerTests(TestCase):
 
         self.assertEqual(metrics.runner_status, "error")
         self.assertIn("k6 is not installed", metrics.runner_message)
+        self.assertEqual(metrics.error_rate_source, "none")
+        self.assertEqual(metrics.parse_warnings, ["k6_not_installed"])

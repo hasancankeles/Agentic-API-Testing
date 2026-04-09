@@ -107,6 +107,10 @@ export interface LoadTestResult {
   runner_exit_code: number | null;
   runner_stdout_excerpt: string;
   runner_stderr_excerpt: string;
+  metric_shape?: 'values' | 'flat' | string | null;
+  request_count_source?: string | null;
+  error_rate_source?: string | null;
+  parse_warnings?: string[];
   raw_metrics?: Record<string, unknown>;
   executed_at: string;
 }
@@ -268,6 +272,10 @@ export interface FlowGenerationSummary {
   generation_mode?: FlowGenerationMode;
   mutation_policy?: FlowMutationPolicy;
   deterministic_quality_dropped?: number;
+  llm_attempted?: boolean;
+  llm_normalizations_applied?: number;
+  negative_flows_added?: number;
+  negative_generation_skipped_reason?: string | null;
   batch_created_at: string;
 }
 

@@ -77,6 +77,41 @@ function toStatus(value: string): TestStatus {
   return "pending";
 }
 
+function isSuspiciousLoadRun(result: LoadTestResult): boolean {
+  const warnings = result.parse_warnings ?? [];
+  if (warnings.length > 0) {
+    return true;
+  }
+  return result.runner_status === "passed" && result.total_requests === 0;
+}
+
+function diagnosticInterpretation(result: LoadTestResult): string {
+  if (result.runner_status === "error") {
+    return "Runner error occurred. Review stderr/stdout excerpts and parser warnings.";
+  }
+  if (result.runner_status === "failed") {
+    if ((result.runner_message || "").toLowerCase().includes("threshold")) {
+      return "k6 executed but one or more thresholds failed.";
+    }
+    return "k6 returned a non-zero exit code with metrics available.";
+  }
+  if (result.total_requests === 0) {
+    return "Run is marked passed but request count is zero. Treat this run as suspicious.";
+  }
+  return "Metrics look consistent: requests were executed and parsed.";
+}
+
+function thresholdInterpretation(result: LoadTestResult): string {
+  const message = (result.runner_message || "").toLowerCase();
+  if (message.includes("threshold")) {
+    return "Threshold breach detected.";
+  }
+  if (result.runner_status === "passed") {
+    return "No threshold breach reported by runner.";
+  }
+  return "Threshold status unclear; inspect raw metrics and runner output.";
+}
+
 function parseJsonObject(
   raw: string,
   fieldName: string
@@ -1148,7 +1183,14 @@ export default function LoadTests() {
                     >
                       <td className="px-3 py-3 text-zinc-200">{result.scenario_name}</td>
                       <td className="px-3 py-3">
-                        <StatusBadge status={toStatus(result.runner_status)} />
+                        <div className="flex items-center gap-2">
+                          <StatusBadge status={toStatus(result.runner_status)} />
+                          {isSuspiciousLoadRun(result) && (
+                            <span className="rounded border border-amber-700/60 bg-amber-900/40 px-2 py-0.5 text-xs font-medium text-amber-300">
+                              Warning
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-3 py-3 text-right text-zinc-300">{result.total_requests}</td>
                       <td className="px-3 py-3 text-right text-zinc-300">{result.failed_requests}</td>
@@ -1175,6 +1217,11 @@ export default function LoadTests() {
               <div className="flex flex-wrap items-center gap-3">
                 <h3 className="text-base font-medium text-zinc-100">{selectedResult.scenario_name}</h3>
                 <StatusBadge status={toStatus(selectedResult.runner_status)} />
+                {isSuspiciousLoadRun(selectedResult) && (
+                  <span className="rounded border border-amber-700/60 bg-amber-900/40 px-2 py-0.5 text-xs font-medium text-amber-300">
+                    Suspicious run
+                  </span>
+                )}
                 <span className="font-mono text-xs text-zinc-500">{selectedResult.id}</span>
               </div>
 
@@ -1210,6 +1257,51 @@ export default function LoadTests() {
                   <span className="text-zinc-500">Executed:</span>{" "}
                   {formatDate(selectedResult.executed_at)}
                 </p>
+              </div>
+
+              <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+                <h4 className="mb-2 text-sm font-medium text-zinc-300">Run Diagnostics</h4>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  <div>
+                    <p className="text-xs text-zinc-500">Metric shape</p>
+                    <p className="text-sm text-zinc-200">{selectedResult.metric_shape ?? "unknown"}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-zinc-500">Request count source</p>
+                    <p className="text-sm text-zinc-200">
+                      {selectedResult.request_count_source ?? "unknown"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-zinc-500">Error-rate source</p>
+                    <p className="text-sm text-zinc-200">
+                      {selectedResult.error_rate_source ?? "unknown"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-zinc-500">Parse warnings</p>
+                    <p className="text-sm text-zinc-200">
+                      {(selectedResult.parse_warnings ?? []).length}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-sm text-zinc-300">
+                  <p>
+                    <span className="text-zinc-500">Computed interpretation:</span>{" "}
+                    {diagnosticInterpretation(selectedResult)}
+                  </p>
+                  <p>
+                    <span className="text-zinc-500">Threshold/fallback interpretation:</span>{" "}
+                    {thresholdInterpretation(selectedResult)}
+                  </p>
+                </div>
+
+                {(selectedResult.parse_warnings ?? []).length > 0 && (
+                  <div className="mt-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-sm text-amber-300">
+                    Parse warnings: {(selectedResult.parse_warnings ?? []).join(", ")}
+                  </div>
+                )}
               </div>
 
               <div className="grid gap-2">

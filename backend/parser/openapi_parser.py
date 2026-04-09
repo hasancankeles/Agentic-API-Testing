@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urljoin, urlparse
 
 import yaml
 import requests as http_requests
@@ -209,12 +210,60 @@ def _extract_ws_messages_from_description(description: str) -> list[ParsedWebSoc
     return messages
 
 
+def _expand_server_url(server_entry: dict) -> str:
+    raw = str(server_entry.get("url", "") or "").strip()
+    if not raw:
+        return ""
+    variables = server_entry.get("variables", {})
+    if not isinstance(variables, dict):
+        return raw
+    expanded = raw
+    for name, meta in variables.items():
+        if not isinstance(meta, dict):
+            continue
+        default_value = meta.get("default")
+        if default_value is None:
+            continue
+        expanded = expanded.replace(f"{{{name}}}", str(default_value))
+    return expanded
+
+
+def _resolve_base_url(spec_source: str, servers: list[dict]) -> str:
+    urls: list[str] = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        expanded = _expand_server_url(server)
+        if expanded:
+            urls.append(expanded)
+
+    if not urls:
+        return ""
+
+    # Prefer explicit absolute HTTP(S) server URLs when present.
+    for candidate in urls:
+        parsed = urlparse(candidate)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return candidate
+
+    first = urls[0]
+    source_parsed = urlparse(spec_source)
+    if source_parsed.scheme in {"http", "https"} and source_parsed.netloc:
+        return urljoin(spec_source, first)
+
+    # Local file/raw content with relative server URL: return an absolute
+    # fallback so runners don't get invalid URL-without-scheme errors.
+    if first.startswith("/"):
+        return f"http://localhost:8080{first}"
+    return f"http://localhost:8080/{first.lstrip('/')}"
+
+
 def parse_openapi(source: str) -> ParsedAPI:
     """Parse an OpenAPI spec into a structured ParsedAPI model."""
     spec = load_spec(source)
     info = spec.get("info", {})
     servers = spec.get("servers", [])
-    base_url = servers[0].get("url", "") if servers else ""
+    base_url = _resolve_base_url(source, servers if isinstance(servers, list) else [])
     global_security = spec.get("security")
     all_schemas = spec.get("components", {}).get("schemas", {}) or {}
 

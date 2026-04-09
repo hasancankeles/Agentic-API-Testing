@@ -379,6 +379,10 @@ class LoadTestMetrics(BaseModel):
     runner_exit_code: int | None = None
     runner_stdout_excerpt: str = ""
     runner_stderr_excerpt: str = ""
+    metric_shape: str | None = None
+    request_count_source: str | None = None
+    error_rate_source: str | None = None
+    parse_warnings: list[str] = Field(default_factory=list)
     raw_metrics: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -63,6 +63,10 @@ def _metrics_for(scenario_id: str, scenario_name: str) -> LoadTestMetrics:
         runner_exit_code=0,
         runner_stdout_excerpt="stdout",
         runner_stderr_excerpt="",
+        metric_shape="values",
+        request_count_source="http_reqs.count",
+        error_rate_source="http_req_failed.rate",
+        parse_warnings=[],
         raw_metrics={"summary": True},
     )
 
@@ -152,6 +156,8 @@ class LoadTestRouteTests(TestCase):
             self.assertEqual(run_payload["failed"], 0)
             self.assertEqual(run_payload["errors"], 0)
             self.assertEqual(run_payload["results"][0]["runner_status"], "passed")
+            self.assertEqual(run_payload["results"][0]["metric_shape"], "values")
+            self.assertIn("parse_warnings", run_payload["results"][0])
             result_id = run_payload["results"][0]["id"]
 
             list_results_res = client.get("/api/loadtest/results")
@@ -160,12 +166,14 @@ class LoadTestRouteTests(TestCase):
                 item for item in list_results_res.json() if item["id"] == result_id
             )
             self.assertEqual(listed["runner_message"], "ok")
+            self.assertEqual(listed["request_count_source"], "http_reqs.count")
             self.assertNotIn("raw_metrics", listed)
 
             detail_res = client.get(f"/api/loadtest/results/{result_id}")
             self.assertEqual(detail_res.status_code, 200)
             detail = detail_res.json()
             self.assertEqual(detail["runner_status"], "passed")
+            self.assertEqual(detail["error_rate_source"], "http_req_failed.rate")
             self.assertIn("raw_metrics", detail)
 
             delete_res = client.delete(f"/api/loadtest/scenarios/{scenario_id}")

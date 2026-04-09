@@ -112,6 +112,84 @@ function toTestStatus(status: string): TestStatus {
   return "pending";
 }
 
+type SuggestionChip = {
+  label: string;
+  action: "deterministic_first" | "safe_policy" | "reduce_steps" | "disable_negative" | "retry_hybrid";
+};
+
+type FallbackDiagnostics = {
+  category: string;
+  detail: string;
+  suggestions: SuggestionChip[];
+};
+
+function analyzeFallbackReason(reason: string): FallbackDiagnostics {
+  const detail = (reason || "").trim();
+  if (!detail) {
+    return {
+      category: "none",
+      detail: "",
+      suggestions: [],
+    };
+  }
+
+  const lowered = detail.toLowerCase();
+  if (lowered.includes("missing_gemini_api_key") || lowered.includes("api key")) {
+    return {
+      category: "configuration",
+      detail,
+      suggestions: [
+        { label: "Switch to deterministic_first", action: "deterministic_first" },
+        { label: "Retry with hybrid_auto", action: "retry_hybrid" },
+      ],
+    };
+  }
+
+  if (lowered.includes("validation error") || lowered.includes("pydantic") || lowered.includes("missing")) {
+    return {
+      category: "schema_mismatch",
+      detail,
+      suggestions: [
+        { label: "Switch to deterministic_first", action: "deterministic_first" },
+        { label: "Use safe mutation policy", action: "safe_policy" },
+        { label: "Reduce max steps", action: "reduce_steps" },
+      ],
+    };
+  }
+
+  if (lowered.includes("quality")) {
+    return {
+      category: "quality_gate",
+      detail,
+      suggestions: [
+        { label: "Use safe mutation policy", action: "safe_policy" },
+        { label: "Reduce max steps", action: "reduce_steps" },
+        { label: "Disable negatives for retry", action: "disable_negative" },
+      ],
+    };
+  }
+
+  if (lowered.includes("timeout") || lowered.includes("upstream") || lowered.includes("server error")) {
+    return {
+      category: "upstream_unavailable",
+      detail,
+      suggestions: [
+        { label: "Retry with hybrid_auto", action: "retry_hybrid" },
+        { label: "Switch to deterministic_first", action: "deterministic_first" },
+      ],
+    };
+  }
+
+  return {
+    category: "other",
+    detail,
+    suggestions: [
+      { label: "Use safe mutation policy", action: "safe_policy" },
+      { label: "Switch to deterministic_first", action: "deterministic_first" },
+    ],
+  };
+}
+
 const methodStyles: Record<string, string> = {
   GET: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
   POST: "bg-blue-500/20 text-blue-400 border-blue-500/30",
@@ -205,6 +283,30 @@ export default function FlowTests() {
   );
   const allFlowsSelected =
     flows.length > 0 && selectedFlowIds.length === flows.length;
+  const fallbackDiagnostics = useMemo(
+    () => analyzeFallbackReason(generationSummary?.fallback_reason ?? ""),
+    [generationSummary]
+  );
+
+  const applySuggestionChip = (action: SuggestionChip["action"]) => {
+    if (action === "deterministic_first") {
+      setGenerationMode("deterministic_first");
+      return;
+    }
+    if (action === "safe_policy") {
+      setMutationPolicy("safe");
+      return;
+    }
+    if (action === "reduce_steps") {
+      setMaxStepsPerFlow((current) => Math.max(2, Math.min(current, 6)));
+      return;
+    }
+    if (action === "disable_negative") {
+      setIncludeNegative(false);
+      return;
+    }
+    setGenerationMode("hybrid_auto");
+  };
 
   const fetchFlows = useCallback(async () => {
     setFlowsLoading(true);
@@ -602,6 +704,32 @@ export default function FlowTests() {
                     {formatDate(generationSummary.batch_created_at)}
                   </p>
                 </div>
+                <div>
+                  <p className="text-xs text-zinc-500">LLM attempted</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.llm_attempted ? "yes" : "no"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">LLM normalizations</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.llm_normalizations_applied ?? 0}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">Negative flows added</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.negative_flows_added ?? 0}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">Negative generation</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.negative_generation_skipped_reason
+                      ? "skipped"
+                      : "applied"}
+                  </p>
+                </div>
               </div>
               {generationSummary.objectives_used &&
                 generationSummary.objectives_used.length > 0 && (
@@ -609,9 +737,41 @@ export default function FlowTests() {
                     Objectives: {generationSummary.objectives_used.join(", ")}
                   </p>
                 )}
-              {generationSummary.fallback_reason && (
+              {(generationSummary.fallback_reason || generationSummary.fallback_used) && (
+                <div className="mt-3 rounded-lg border border-amber-800/60 bg-amber-950/20 p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm text-zinc-300">Fallback category:</span>
+                    <span className="rounded border border-amber-700/70 bg-amber-900/40 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-amber-300">
+                      {fallbackDiagnostics.category}
+                    </span>
+                  </div>
+                  {fallbackDiagnostics.detail && (
+                    <details className="mt-2 rounded border border-zinc-800 bg-zinc-950/60 p-2">
+                      <summary className="cursor-pointer text-xs text-zinc-400">
+                        Show fallback details
+                      </summary>
+                      <p className="mt-2 text-sm text-amber-300">{fallbackDiagnostics.detail}</p>
+                    </details>
+                  )}
+                  {fallbackDiagnostics.suggestions.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {fallbackDiagnostics.suggestions.map((chip) => (
+                        <button
+                          key={`${chip.action}:${chip.label}`}
+                          type="button"
+                          onClick={() => applySuggestionChip(chip.action)}
+                          className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                        >
+                          {chip.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {generationSummary.negative_generation_skipped_reason && (
                 <p className="mt-2 text-sm text-amber-400">
-                  Fallback reason: {generationSummary.fallback_reason}
+                  Negative generation skipped: {generationSummary.negative_generation_skipped_reason}
                 </p>
               )}
             </div>

@@ -130,6 +130,136 @@ def _parse_json_response(raw: str) -> dict:
         raise
 
 
+def _normalize_json_path_like(path: object) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    if raw == "$":
+        return ""
+    if raw.startswith("$."):
+        raw = raw[2:]
+    elif raw.startswith("$"):
+        raw = raw[1:]
+    raw = raw.lstrip(".")
+    raw = re.sub(r"\[(\d+)\]", r".\1", raw)
+    raw = raw.lstrip(".")
+    if raw.startswith("body."):
+        raw = raw[5:]
+    if raw.startswith("headers."):
+        raw = raw[8:]
+    return raw
+
+
+def _sanitize_ctx_var_name(value: str, fallback: str = "value") -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip()).strip("_").lower()
+    if not normalized:
+        return fallback
+    if normalized[0].isdigit():
+        return f"v_{normalized}"
+    return normalized
+
+
+def _normalize_extract_source(value: object) -> str:
+    lowered = str(value or "").strip().lower()
+    if lowered in {"body", "response_body"}:
+        return "body"
+    if lowered in {"headers", "header", "response_headers"}:
+        return "headers"
+    if lowered in {"status_code", "status", "code"}:
+        return "status_code"
+    return "body"
+
+
+def _normalize_extract_entry(entry: object) -> tuple[dict | None, int]:
+    if not isinstance(entry, dict):
+        return None, 0
+
+    source_input = entry.get("from", entry.get("source"))
+    source = _normalize_extract_source(source_input)
+    path = _normalize_json_path_like(
+        entry.get("path", entry.get("json_path", entry.get("jsonPath", "")))
+    )
+    if source == "status_code":
+        path = ""
+
+    var_input = entry.get("var", entry.get("key", entry.get("name", "")))
+    var_candidate = str(var_input or "").strip()
+    if not var_candidate:
+        if source == "status_code":
+            var_candidate = "status_code"
+        elif path:
+            tail = [part for part in path.split(".") if part and not part.isdigit()]
+            var_candidate = tail[-1] if tail else "value"
+        elif source == "headers":
+            var_candidate = "header_value"
+        else:
+            var_candidate = "value"
+    var = _sanitize_ctx_var_name(var_candidate)
+
+    required_raw = entry.get("required", True)
+    if isinstance(required_raw, str):
+        required = required_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        required = bool(required_raw)
+
+    normalized = {
+        "var": var,
+        "from": source,
+        "path": path,
+        "required": required,
+    }
+
+    legacy_keys = {"key", "json_path", "jsonPath", "source", "name"}
+    used_legacy = any(key in entry for key in legacy_keys)
+    changed = 1 if used_legacy else 0
+    if (
+        entry.get("var") != normalized["var"]
+        or entry.get("from") != normalized["from"]
+        or entry.get("path", "") != normalized["path"]
+        or bool(entry.get("required", True)) != normalized["required"]
+    ):
+        changed = 1
+
+    return normalized, changed
+
+
+def _normalize_llm_flow_payload(raw_flow: dict) -> tuple[dict, int]:
+    if not isinstance(raw_flow, dict):
+        return raw_flow, 0
+
+    normalized_flow = dict(raw_flow)
+    normalizations = 0
+    raw_steps = raw_flow.get("steps")
+    if not isinstance(raw_steps, list):
+        return normalized_flow, normalizations
+
+    normalized_steps: list[dict] = []
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, dict):
+            normalized_steps.append(raw_step)
+            continue
+
+        step = dict(raw_step)
+        raw_extract = raw_step.get("extract")
+        if isinstance(raw_extract, dict):
+            raw_extract = [raw_extract]
+            normalizations += 1
+
+        if isinstance(raw_extract, list):
+            normalized_extract: list[dict] = []
+            for entry in raw_extract:
+                normalized_entry, changed = _normalize_extract_entry(entry)
+                if normalized_entry is None:
+                    continue
+                normalizations += changed
+                normalized_extract.append(normalized_entry)
+            step["extract"] = normalized_extract
+        normalized_steps.append(step)
+
+    normalized_flow["steps"] = normalized_steps
+    return normalized_flow, normalizations
+
+
 def _normalize_path(path: str, base_url: str) -> str:
     raw = (path or "").strip()
     if not raw:
@@ -1010,6 +1140,119 @@ def _quality_filter(
     return accepted, dropped
 
 
+def _endpoint_status_codes(endpoint: ParsedEndpoint) -> set[int]:
+    codes: set[int] = set()
+    for response in endpoint.responses:
+        status = str(response.status_code)
+        if status.isdigit():
+            codes.add(int(status))
+    return codes
+
+
+def _build_negative_auth_step(
+    endpoint: ParsedEndpoint,
+    req: FlowGenerateRequest,
+    order: int,
+) -> FlowStep:
+    io_meta = _build_endpoint_io([endpoint])[_endpoint_key(endpoint)]
+    step = _build_step(endpoint, io_meta, order, set(_DEFAULT_EXTERNAL_CTX_VARS), req)
+    step_id_base = _sanitize_ctx_var_name(step.step_id or "negative_auth", fallback="negative_auth")
+    status_codes = _endpoint_status_codes(endpoint)
+    expected = 401 if 401 in status_codes or 403 not in status_codes else 403
+
+    filtered_headers: dict[str, object] = {}
+    for key, value in step.headers.items():
+        lowered = str(key).lower()
+        if lowered in {"authorization", "x-api-key", "api_key"}:
+            continue
+        filtered_headers[key] = value
+
+    return step.model_copy(
+        update={
+            "step_id": f"{step_id_base}_neg_auth",
+            "name": f"Negative auth: {step.name}",
+            "headers": filtered_headers,
+            "extract": [],
+            "assertions": [TestAssertion(field="status_code", operator="eq", expected=expected)],
+            "expected_status": expected,
+            "required": False,
+        }
+    )
+
+
+def _build_negative_validation_step(
+    endpoint: ParsedEndpoint,
+    req: FlowGenerateRequest,
+    order: int,
+) -> FlowStep:
+    io_meta = _build_endpoint_io([endpoint])[_endpoint_key(endpoint)]
+    step = _build_step(endpoint, io_meta, order, set(_DEFAULT_EXTERNAL_CTX_VARS), req)
+    required_fields = [field for field in endpoint.request_body_required_fields if field]
+    missing_field = required_fields[0] if required_fields else "required_field"
+
+    raw_body = step.body if isinstance(step.body, dict) else {}
+    body = dict(raw_body)
+    body.pop(missing_field, None)
+
+    step_id_base = _sanitize_ctx_var_name(step.step_id or "negative_validation", fallback="negative_validation")
+    return step.model_copy(
+        update={
+            "step_id": f"{step_id_base}_neg_validation",
+            "name": f"Negative validation: missing {missing_field}",
+            "body": body,
+            "extract": [],
+            "assertions": [TestAssertion(field="status_code", operator="eq", expected=400)],
+            "expected_status": 400,
+            "required": False,
+        }
+    )
+
+
+def _inject_negative_step(
+    flows: list[FlowScenario],
+    parsed_api: ParsedAPI,
+    req: FlowGenerateRequest,
+) -> tuple[list[FlowScenario], int, str | None]:
+    if not req.include_negative:
+        return flows, 0, None
+    if not flows:
+        return flows, 0, "no_flows_available"
+
+    target_flow_index: int | None = None
+    for index, flow in enumerate(flows):
+        if len(flow.steps) < req.max_steps_per_flow:
+            target_flow_index = index
+            break
+    if target_flow_index is None:
+        return flows, 0, "all_flows_at_max_steps"
+
+    target_flow = flows[target_flow_index]
+    next_order = len(target_flow.steps) + 1
+
+    auth_candidates = [
+        endpoint
+        for endpoint in parsed_api.endpoints
+        if endpoint.requires_auth or _is_auth_endpoint(endpoint)
+    ]
+    if auth_candidates:
+        negative_step = _build_negative_auth_step(auth_candidates[0], req, next_order)
+    else:
+        validation_candidates = [
+            endpoint
+            for endpoint in parsed_api.endpoints
+            if endpoint.method in {HttpMethod.POST, HttpMethod.PUT, HttpMethod.PATCH}
+            and bool(endpoint.request_body_required_fields)
+        ]
+        if not validation_candidates:
+            return flows, 0, "no_auth_or_validation_negative_pattern"
+        negative_step = _build_negative_validation_step(validation_candidates[0], req, next_order)
+
+    updated_flow = target_flow.model_copy(update={"steps": [*target_flow.steps, negative_step]})
+    updated_flows = list(flows)
+    updated_flows[target_flow_index] = updated_flow
+    return updated_flows, 1, None
+
+
 async def _llm_json_call(
     client: genai.Client,
     model: str,
@@ -1106,7 +1349,7 @@ async def _llm_compose_flows(
     seed_flows: list[FlowScenario],
     scenarios: list[dict],
     dependency_hints: list[dict],
-) -> list[FlowScenario]:
+) -> tuple[list[FlowScenario], int]:
     flow_contract = {
         "flows": [
             {
@@ -1173,21 +1416,24 @@ async def _llm_compose_flows(
         raise FlowGeneratorError("flow composer output must contain a 'flows' array")
 
     validated: list[FlowScenario] = []
+    total_normalizations = 0
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
-        validated.append(FlowScenario.model_validate(item))
+        normalized_item, normalizations = _normalize_llm_flow_payload(item)
+        total_normalizations += normalizations
+        validated.append(FlowScenario.model_validate(normalized_item))
 
     if not validated:
         raise FlowGeneratorError("flow composer returned no valid flows")
-    return validated
+    return validated, total_normalizations
 
 
 async def _llm_critic_repair(
     client: genai.Client,
     req: FlowGenerateRequest,
     flows: list[FlowScenario],
-) -> list[FlowScenario]:
+) -> tuple[list[FlowScenario], int]:
     contract = {
         "flows": [
             {
@@ -1240,15 +1486,18 @@ async def _llm_critic_repair(
         raise FlowGeneratorError("flow critic output must contain a 'flows' array")
 
     validated: list[FlowScenario] = []
+    total_normalizations = 0
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
-        validated.append(FlowScenario.model_validate(item))
+        normalized_item, normalizations = _normalize_llm_flow_payload(item)
+        total_normalizations += normalizations
+        validated.append(FlowScenario.model_validate(normalized_item))
 
     if not validated:
         raise FlowGeneratorError("flow critic returned no valid flows")
 
-    return validated
+    return validated, total_normalizations
 
 
 async def _llm_refine_flows(
@@ -1257,7 +1506,7 @@ async def _llm_refine_flows(
     seed_flows: list[FlowScenario],
     dependency_hints: list[dict],
     objectives: list[str],
-) -> list[FlowScenario]:
+) -> tuple[list[FlowScenario], int]:
     api_key = _get_gemini_api_key()
     if not api_key:
         raise FlowGeneratorError("GEMINI_API_KEY is not set")
@@ -1266,9 +1515,17 @@ async def _llm_refine_flows(
 
     try:
         scenarios = await _llm_plan_scenarios(client, parsed_api, req, objectives, dependency_hints)
-        composed = await _llm_compose_flows(client, parsed_api, req, objectives, seed_flows, scenarios, dependency_hints)
-        criticized = await _llm_critic_repair(client, req, composed)
-        return criticized
+        composed, compose_normalizations = await _llm_compose_flows(
+            client,
+            parsed_api,
+            req,
+            objectives,
+            seed_flows,
+            scenarios,
+            dependency_hints,
+        )
+        criticized, critic_normalizations = await _llm_critic_repair(client, req, composed)
+        return criticized, compose_normalizations + critic_normalizations
     except genai_errors.APIError as exc:
         raise FlowGeneratorError(f"flow planner upstream error: {exc}") from exc
     except Exception as exc:
@@ -1290,6 +1547,8 @@ async def generate_flows(
     source = "deterministic_fallback"
     fallback_reason = "deterministic_only"
     candidate_flows = deterministic_flows
+    llm_attempted = False
+    llm_normalizations_applied = 0
 
     mode = req.generation_mode
     api_key_present = bool(_get_gemini_api_key())
@@ -1304,8 +1563,16 @@ async def generate_flows(
             fallback_reason = "missing_gemini_api_key"
 
     if llm_should_run and api_key_present:
+        llm_attempted = True
         try:
-            refined_flows = await _llm_refine_flows(parsed_api, req, deterministic_flows, dependency_hints, objectives)
+            refined_flows, normalization_count = await _llm_refine_flows(
+                parsed_api,
+                req,
+                deterministic_flows,
+                dependency_hints,
+                objectives,
+            )
+            llm_normalizations_applied = normalization_count
             refined_flows, llm_dropped = _quality_filter(refined_flows, req)
             if refined_flows:
                 candidate_flows = refined_flows
@@ -1339,6 +1606,14 @@ async def generate_flows(
         if not fallback_reason:
             fallback_reason = "quality_filter_removed_all_flows"
 
+    negative_flows_added = 0
+    negative_generation_skipped_reason: str | None = None
+    finalized, negative_flows_added, negative_generation_skipped_reason = _inject_negative_step(
+        finalized,
+        parsed_api,
+        req,
+    )
+
     summary = {
         "flows_generated": len(finalized),
         "source": source,
@@ -1350,6 +1625,10 @@ async def generate_flows(
         "generation_mode": req.generation_mode.value,
         "mutation_policy": req.mutation_policy.value,
         "deterministic_quality_dropped": len(deterministic_dropped),
+        "llm_attempted": llm_attempted,
+        "llm_normalizations_applied": llm_normalizations_applied,
+        "negative_flows_added": negative_flows_added,
+        "negative_generation_skipped_reason": negative_generation_skipped_reason,
         "batch_created_at": created_at.isoformat(),
     }
     return finalized, summary

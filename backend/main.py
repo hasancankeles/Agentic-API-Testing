@@ -481,6 +481,12 @@ def _scenario_to_dict(scenario: LoadTestScenario, created_at: datetime | None = 
 
 
 def _db_load_result_to_dict(db_result: DBLoadTestResult, include_raw: bool = False) -> dict[str, Any]:
+    parser_meta = {}
+    if isinstance(db_result.raw_metrics, dict):
+        maybe_meta = db_result.raw_metrics.get("_parser")
+        if isinstance(maybe_meta, dict):
+            parser_meta = maybe_meta
+
     payload = {
         "id": db_result.id,
         "scenario_id": db_result.scenario_id,
@@ -505,6 +511,14 @@ def _db_load_result_to_dict(db_result: DBLoadTestResult, include_raw: bool = Fal
         "runner_exit_code": db_result.runner_exit_code,
         "runner_stdout_excerpt": db_result.runner_stdout_excerpt or "",
         "runner_stderr_excerpt": db_result.runner_stderr_excerpt or "",
+        "metric_shape": db_result.metric_shape or parser_meta.get("metric_shape"),
+        "request_count_source": db_result.request_count_source or parser_meta.get("request_count_source"),
+        "error_rate_source": db_result.error_rate_source or parser_meta.get("error_rate_source"),
+        "parse_warnings": list(
+            db_result.parse_warnings_json
+            if isinstance(db_result.parse_warnings_json, list)
+            else parser_meta.get("parse_warnings") or []
+        ),
         "executed_at": db_result.executed_at.isoformat() if db_result.executed_at else None,
     }
     if include_raw:
@@ -623,6 +637,10 @@ async def run_load_tests(req: LoadTestRunRequest, db: AsyncSession = Depends(get
             runner_exit_code=metrics.runner_exit_code,
             runner_stdout_excerpt=metrics.runner_stdout_excerpt,
             runner_stderr_excerpt=metrics.runner_stderr_excerpt,
+            metric_shape=metrics.metric_shape,
+            request_count_source=metrics.request_count_source,
+            error_rate_source=metrics.error_rate_source,
+            parse_warnings_json=metrics.parse_warnings,
             raw_metrics=metrics.raw_metrics,
         )
         db.add(db_result)
