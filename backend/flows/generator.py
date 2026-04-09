@@ -7,12 +7,15 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 from urllib.parse import urlparse
 
 from google import genai
 from google.genai import errors as genai_errors
+from pydantic import BaseModel, Field, ValidationError
 
 from models.schemas import (
+    FlowEliminatedCandidate,
     FlowExtractRule,
     FlowGenerateRequest,
     FlowGenerationMode,
@@ -31,6 +34,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FLOW_PLANNER_MODEL = os.getenv("FLOW_PLANNER_MODEL", "gemini-3.1-flash-lite-preview")
 FLOW_COMPOSER_MODEL = os.getenv("FLOW_COMPOSER_MODEL", FLOW_PLANNER_MODEL)
 FLOW_CRITIC_MODEL = os.getenv("FLOW_CRITIC_MODEL", FLOW_PLANNER_MODEL)
+FLOW_REVIEWER_MODEL = os.getenv("FLOW_REVIEWER_MODEL", FLOW_CRITIC_MODEL)
 
 _TEMPLATE_VAR_PATTERN = re.compile(r"\{\{\s*ctx\.([a-zA-Z0-9_.-]+)\s*\}\}")
 _PATH_PARAM_PATTERN = re.compile(r"\{([^{}]+)\}")
@@ -64,6 +68,17 @@ class _DependencyEdge:
     vars: tuple[str, ...]
     priority: str
     reason: str
+
+
+class _FlowReviewDecision(BaseModel):
+    candidate_id: str
+    keep: bool
+    reason_code: str = "accepted"
+    reason: str = ""
+
+
+class _FlowReviewEnvelope(BaseModel):
+    decisions: list[_FlowReviewDecision] = Field(default_factory=list)
 
 
 def _get_gemini_api_key() -> str:
@@ -892,6 +907,160 @@ def _flow_quality_errors(flow: FlowScenario, req: FlowGenerateRequest) -> list[s
     return errors
 
 
+def _flow_signature(flow: FlowScenario) -> tuple[str, ...]:
+    ordered_steps = sorted(flow.steps, key=lambda step: step.order)
+    return tuple(f"{step.method.value}:{step.endpoint}" for step in ordered_steps)
+
+
+def _endpoint_lookup(parsed_api: ParsedAPI) -> dict[tuple[HttpMethod, str], ParsedEndpoint]:
+    lookup: dict[tuple[HttpMethod, str], ParsedEndpoint] = {}
+    for endpoint in parsed_api.endpoints:
+        lookup[(endpoint.method, _normalize_path(endpoint.path, parsed_api.base_url))] = endpoint
+    return lookup
+
+
+def _successful_responses(endpoint: ParsedEndpoint) -> list:
+    successful = [
+        response
+        for response in endpoint.responses
+        if str(response.status_code).isdigit() and 200 <= int(response.status_code) < 300
+    ]
+    return successful or list(endpoint.responses)
+
+
+def _extract_from_example(value: Any, path: str) -> Any:
+    normalized = _normalize_json_path_like(path)
+    if not normalized:
+        return value
+
+    current = value
+    for part in [item for item in normalized.split(".") if item]:
+        if isinstance(current, list) and part.isdigit():
+            index = int(part)
+            if index >= len(current):
+                return None
+            current = current[index]
+        elif isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def _response_examples(endpoint: ParsedEndpoint) -> list[Any]:
+    examples: list[Any] = []
+    for response in _successful_responses(endpoint):
+        if response.example is not None:
+            examples.append(response.example)
+        for example in (response.examples or {}).values():
+            if example is not None:
+                examples.append(example)
+    return examples
+
+
+def _response_supports_body_path(endpoint: ParsedEndpoint, path: str) -> bool:
+    normalized = _normalize_json_path_like(path)
+    if not normalized:
+        return True
+
+    examples = _response_examples(endpoint)
+    if examples:
+        return any(_extract_from_example(example, normalized) is not None for example in examples)
+
+    content_types = [str(response.content_type or "").lower() for response in _successful_responses(endpoint)]
+    return any("json" in content_type or "+json" in content_type for content_type in content_types)
+
+
+def _reason_code_for_quality_error(error: str) -> str:
+    lowered = error.lower()
+    if "unresolved endpoint placeholders" in lowered:
+        return "unresolved_path_params"
+    if "missing context vars" in lowered:
+        return "unresolved_context_dependency"
+    if "read-after-write verification" in lowered:
+        return "incoherent_flow"
+    if "mutation policy" in lowered or "forbids delete" in lowered:
+        return "mutation_policy_violation"
+    return "quality_gate"
+
+
+def _summarize_reasons(reasons: list[tuple[str, str]]) -> tuple[str, str]:
+    if not reasons:
+        return "accepted", ""
+
+    primary_code = reasons[0][0]
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for _code, reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        fragments.append(reason)
+        if len(fragments) >= 2:
+            break
+    return primary_code, "; ".join(fragments)
+
+
+def _static_review_flow(
+    flow: FlowScenario,
+    parsed_api: ParsedAPI,
+    req: FlowGenerateRequest,
+    endpoint_map: dict[tuple[HttpMethod, str], ParsedEndpoint],
+    seen_signatures: set[tuple[str, ...]],
+) -> list[tuple[str, str]]:
+    reasons: list[tuple[str, str]] = []
+
+    if len(flow.steps) < 2:
+        reasons.append(("too_short", "flow must contain at least two executable steps"))
+
+    signature = _flow_signature(flow)
+    if signature in seen_signatures:
+        reasons.append(("duplicate_flow", "flow duplicates an existing candidate signature"))
+
+    for error in _flow_quality_errors(flow, req):
+        reasons.append((_reason_code_for_quality_error(error), error))
+
+    for step in flow.steps:
+        endpoint_key = (step.method, _normalize_path(step.endpoint, parsed_api.base_url))
+        endpoint = endpoint_map.get(endpoint_key)
+        if endpoint is None:
+            reasons.append(
+                (
+                    "unknown_endpoint",
+                    f"step {step.step_id}: {step.method.value} {step.endpoint} is not present in the parsed API",
+                )
+            )
+            continue
+
+        for rule in step.extract:
+            if rule.source.value == "body" and not _response_supports_body_path(endpoint, rule.path):
+                reasons.append(
+                    (
+                        "impossible_extraction",
+                        (
+                            f"step {step.step_id}: extract '{rule.var}' from body:{rule.path or '<body>'} "
+                            f"is unsupported by {step.method.value} {step.endpoint} response shape"
+                        ),
+                    )
+                )
+            if (
+                rule.source.value == "body"
+                and ("token" in rule.var.lower() or "token" in rule.path.lower())
+                and not _response_supports_body_path(endpoint, rule.path or "token")
+            ):
+                reasons.append(
+                    (
+                        "unsupported_auth_assumption",
+                        (
+                            f"step {step.step_id}: auth/token extraction is not supported by "
+                            f"{step.method.value} {step.endpoint} response examples or content type"
+                        ),
+                    )
+                )
+
+    return reasons
+
+
 def _build_api_context(parsed_api: ParsedAPI) -> str:
     lines: list[str] = [
         f"API: {parsed_api.title} v{parsed_api.version}",
@@ -905,9 +1074,18 @@ def _build_api_context(parsed_api: ParsedAPI) -> str:
         )
         if endpoint.request_body_required_fields:
             lines.append(f"  request_required_fields={endpoint.request_body_required_fields}")
+        if endpoint.request_body_example is not None:
+            lines.append(f"  request_example={json.dumps(endpoint.request_body_example, ensure_ascii=True)}")
         if endpoint.response_examples:
             lines.append(f"  response_examples={json.dumps(endpoint.response_examples, ensure_ascii=True)}")
         for response in endpoint.responses:
+            lines.append(
+                "  response "
+                f"{response.status_code} content_type={response.content_type!r} "
+                f"description={response.description!r} schema_ref={response.schema_ref!r}"
+            )
+            if response.example is not None:
+                lines.append(f"    example={json.dumps(response.example, ensure_ascii=True)}")
             if response.links:
                 lines.append(
                     f"  response {response.status_code} links={json.dumps(response.links, ensure_ascii=True)}"
@@ -1229,11 +1407,18 @@ def _inject_negative_step(
     target_flow = flows[target_flow_index]
     next_order = len(target_flow.steps) + 1
 
-    auth_candidates = [
-        endpoint
-        for endpoint in parsed_api.endpoints
-        if endpoint.requires_auth or _is_auth_endpoint(endpoint)
-    ]
+    auth_candidates = sorted(
+        [
+            endpoint
+            for endpoint in parsed_api.endpoints
+            if endpoint.requires_auth or _is_auth_endpoint(endpoint)
+        ],
+        key=lambda endpoint: (
+            0 if endpoint.requires_auth else 1,
+            0 if {401, 403} & _endpoint_status_codes(endpoint) else 1,
+            0 if endpoint.method == HttpMethod.GET else 1,
+        ),
+    )
     if auth_candidates:
         negative_step = _build_negative_auth_step(auth_candidates[0], req, next_order)
     else:
@@ -1248,6 +1433,9 @@ def _inject_negative_step(
         negative_step = _build_negative_validation_step(validation_candidates[0], req, next_order)
 
     updated_flow = target_flow.model_copy(update={"steps": [*target_flow.steps, negative_step]})
+    validation_errors = _flow_quality_errors(updated_flow, req)
+    if validation_errors:
+        return flows, 0, f"negative_step_invalid: {validation_errors[0]}"
     updated_flows = list(flows)
     updated_flows[target_flow_index] = updated_flow
     return updated_flows, 1, None
@@ -1500,6 +1688,223 @@ async def _llm_critic_repair(
     return validated, total_normalizations
 
 
+def _pure_llm_candidate_limit(req: FlowGenerateRequest) -> int:
+    return max(req.max_flows, min(req.max_flows * 2, 24))
+
+
+async def _llm_generate_candidate_flows(
+    client: genai.Client,
+    parsed_api: ParsedAPI,
+    req: FlowGenerateRequest,
+    objectives: list[str],
+    dependency_hints: list[dict],
+) -> tuple[list[FlowScenario], int, list[FlowEliminatedCandidate]]:
+    candidate_limit = _pure_llm_candidate_limit(req)
+    flow_contract = {
+        "flows": [
+            {
+                "name": "...",
+                "description": "...",
+                "persona": "...",
+                "preconditions": ["..."],
+                "tags": ["..."],
+                "steps": [
+                    {
+                        "step_id": "...",
+                        "order": 1,
+                        "name": "...",
+                        "method": "GET",
+                        "endpoint": "/...",
+                        "headers": {"Authorization": "Bearer {{ctx.auth_token}}"},
+                        "query_params": {},
+                        "path_params": {},
+                        "body": None,
+                        "extract": [{"var": "item_id", "from": "body", "path": "id", "required": True}],
+                        "assertions": [{"field": "status_code", "operator": "eq", "expected": 200}],
+                        "expected_status": 200,
+                        "required": True,
+                    }
+                ],
+            }
+        ]
+    }
+
+    prompt = "\n".join(
+        [
+            "You are generating executable API flow tests directly from parsed OpenAPI context.",
+            "Output JSON only.",
+            "Contract:",
+            json.dumps(flow_contract, ensure_ascii=True, indent=2),
+            "Hard rules:",
+            "- Use only operations that exist in the API context.",
+            "- Endpoint must be a normalized relative path, never a full URL.",
+            "- Use {{ctx.var}} only when an earlier step extracts that variable or it exists in app_context.",
+            "- Prefer distinct workflows with 3+ steps when the API supports them.",
+            "- Every mutating flow should include a verification read step when possible.",
+            "- Do not invent auth tokens or body fields that are not supported by response content types or examples.",
+            "- Respect mutation policy, include_negative separately, and max steps.",
+            "Request preferences:",
+            f"candidate_limit={candidate_limit}",
+            f"max_flows={req.max_flows}",
+            f"max_steps_per_flow={req.max_steps_per_flow}",
+            f"mutation_policy={req.mutation_policy.value}",
+            f"personas={json.dumps(req.personas, ensure_ascii=True)}",
+            f"app_context={json.dumps(req.app_context, ensure_ascii=True)}",
+            "Diversity goals:",
+            json.dumps(objectives, ensure_ascii=True),
+            "Dependency hints:",
+            json.dumps(dependency_hints, ensure_ascii=True, indent=2),
+            "API context:",
+            _build_api_context(parsed_api),
+        ]
+    )
+
+    payload = await _llm_json_call(client, FLOW_COMPOSER_MODEL, prompt, "pure llm flow generator")
+    raw_flows = payload.get("flows")
+    if not isinstance(raw_flows, list):
+        raise FlowGeneratorError("pure llm generator output must contain a 'flows' array")
+
+    validated: list[FlowScenario] = []
+    schema_invalid: list[FlowEliminatedCandidate] = []
+    total_normalizations = 0
+    for index, item in enumerate(raw_flows, start=1):
+        if not isinstance(item, dict):
+            schema_invalid.append(
+                FlowEliminatedCandidate(
+                    name=f"Candidate {index}",
+                    reason_code="schema_invalid",
+                    reason="candidate flow must be a JSON object",
+                )
+            )
+            continue
+        normalized_item, normalizations = _normalize_llm_flow_payload(item)
+        total_normalizations += normalizations
+        try:
+            validated.append(FlowScenario.model_validate(normalized_item))
+        except ValidationError as exc:
+            schema_invalid.append(
+                FlowEliminatedCandidate(
+                    name=str(item.get("name") or f"Candidate {index}"),
+                    reason_code="schema_invalid",
+                    reason=str(exc.errors()[0].get("msg") or "candidate failed schema validation"),
+                )
+            )
+
+    if not validated and not schema_invalid:
+        raise FlowGeneratorError("pure llm generator returned no valid flows")
+
+    return validated, total_normalizations, schema_invalid
+
+
+async def _llm_review_candidates(
+    client: genai.Client,
+    parsed_api: ParsedAPI,
+    req: FlowGenerateRequest,
+    flows: list[tuple[str, FlowScenario]],
+) -> dict[str, _FlowReviewDecision]:
+    contract = {
+        "decisions": [
+            {
+                "candidate_id": "candidate_1",
+                "keep": True,
+                "reason_code": "accepted",
+                "reason": "brief explanation",
+            }
+        ]
+    }
+
+    candidates_payload = [
+        {
+            "candidate_id": candidate_id,
+            "flow": flow.model_dump(mode="json", by_alias=True),
+        }
+        for candidate_id, flow in flows
+    ]
+    prompt = "\n".join(
+        [
+            "You are a strict reviewer for generated API flow tests.",
+            "Output JSON only.",
+            "Contract:",
+            json.dumps(contract, ensure_ascii=True, indent=2),
+            "Reject a candidate when it has broken dependencies, impossible extractions, unsupported auth/token assumptions, duplicate behavior, unknown endpoints, or incoherent state progression.",
+            "Keep the reason concise and actionable.",
+            "Request preferences:",
+            f"mutation_policy={req.mutation_policy.value}",
+            f"max_steps_per_flow={req.max_steps_per_flow}",
+            "API context:",
+            _build_api_context(parsed_api),
+            "Candidate flows:",
+            json.dumps(candidates_payload, ensure_ascii=True, indent=2),
+        ]
+    )
+
+    payload = await _llm_json_call(client, FLOW_REVIEWER_MODEL, prompt, "flow reviewer")
+    envelope = _FlowReviewEnvelope.model_validate(payload)
+    return {decision.candidate_id: decision for decision in envelope.decisions}
+
+
+async def _review_candidate_flows(
+    parsed_api: ParsedAPI,
+    req: FlowGenerateRequest,
+    flows: list[FlowScenario],
+    initial_eliminated: list[FlowEliminatedCandidate] | None = None,
+) -> tuple[list[FlowScenario], list[FlowEliminatedCandidate], bool]:
+    endpoint_map = _endpoint_lookup(parsed_api)
+    seen_signatures: set[tuple[str, ...]] = set()
+    reviewable: list[tuple[str, FlowScenario]] = []
+    eliminated: list[FlowEliminatedCandidate] = list(initial_eliminated or [])
+
+    for index, flow in enumerate(flows, start=1):
+        reasons = _static_review_flow(flow, parsed_api, req, endpoint_map, seen_signatures)
+        if reasons:
+            reason_code, reason = _summarize_reasons(reasons)
+            eliminated.append(
+                FlowEliminatedCandidate(
+                    name=flow.name or f"Candidate {index}",
+                    reason_code=reason_code,
+                    reason=reason,
+                )
+            )
+            continue
+        seen_signatures.add(_flow_signature(flow))
+        reviewable.append((f"candidate_{index}", flow))
+
+    if not reviewable:
+        return [], eliminated, False
+
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        raise FlowGeneratorError("reviewer_missing_gemini_api_key")
+
+    client = genai.Client(api_key=api_key)
+    decisions = await _llm_review_candidates(client, parsed_api, req, reviewable)
+
+    accepted: list[FlowScenario] = []
+    for candidate_id, flow in reviewable:
+        decision = decisions.get(candidate_id)
+        if decision is None:
+            eliminated.append(
+                FlowEliminatedCandidate(
+                    name=flow.name,
+                    reason_code="reviewer_missing_decision",
+                    reason="reviewer returned no decision for this candidate",
+                )
+            )
+            continue
+        if decision.keep:
+            accepted.append(flow)
+            continue
+        eliminated.append(
+            FlowEliminatedCandidate(
+                name=flow.name,
+                reason_code=decision.reason_code or "reviewer_rejected",
+                reason=decision.reason or "reviewer rejected this candidate",
+            )
+        )
+
+    return accepted[: req.max_flows], eliminated, True
+
+
 async def _llm_refine_flows(
     parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
@@ -1546,78 +1951,123 @@ async def generate_flows(
 
     source = "deterministic_fallback"
     fallback_reason = "deterministic_only"
-    candidate_flows = deterministic_flows
+    candidate_flows: list[FlowScenario] = deterministic_flows
     llm_attempted = False
     llm_normalizations_applied = 0
+    candidate_flows_reviewed = 0
+    reviewer_applied = False
+    reviewer_mode: str | None = None
+    eliminated_flows: list[FlowEliminatedCandidate] = []
 
     mode = req.generation_mode
     api_key_present = bool(_get_gemini_api_key())
+    created_at = datetime.utcnow()
 
-    if mode == FlowGenerationMode.DETERMINISTIC_FIRST:
-        llm_should_run = False
-    elif mode == FlowGenerationMode.HYBRID_AUTO:
-        llm_should_run = api_key_present
-    else:  # LLM_FIRST
-        llm_should_run = api_key_present
+    if mode == FlowGenerationMode.PURE_LLM:
+        llm_attempted = api_key_present
+        source = "pure_llm"
+        candidate_flows = []
+        fallback_reason = ""
         if not api_key_present:
             fallback_reason = "missing_gemini_api_key"
+        else:
+            try:
+                client = genai.Client(api_key=_get_gemini_api_key())
+                generated_flows, normalization_count, schema_invalid = await _llm_generate_candidate_flows(
+                    client,
+                    parsed_api,
+                    req,
+                    objectives,
+                    dependency_hints,
+                )
+                llm_normalizations_applied = normalization_count
+                candidate_flows_reviewed = len(generated_flows) + len(schema_invalid)
+                candidate_flows, eliminated_flows, reviewer_applied = await _review_candidate_flows(
+                    parsed_api,
+                    req,
+                    generated_flows,
+                    schema_invalid,
+                )
+                reviewer_mode = "static_llm" if reviewer_applied else None
+                if not candidate_flows:
+                    fallback_reason = "pure_llm_reviewer_rejected_all_candidates"
+            except Exception as exc:
+                logger.warning("flow.generate.pure_llm_failed reason=%s", exc)
+                fallback_reason = str(exc)
+        finalized = _finalize_flows(candidate_flows, req, flow_generation_id, created_at)
+    else:
+        if mode == FlowGenerationMode.DETERMINISTIC_FIRST:
+            llm_should_run = False
+        elif mode == FlowGenerationMode.HYBRID_AUTO:
+            llm_should_run = api_key_present
+            fallback_reason = ""
+        else:  # LLM_FIRST
+            llm_should_run = api_key_present
+            fallback_reason = "" if api_key_present else "missing_gemini_api_key"
 
-    if llm_should_run and api_key_present:
-        llm_attempted = True
-        try:
-            refined_flows, normalization_count = await _llm_refine_flows(
-                parsed_api,
-                req,
-                deterministic_flows,
-                dependency_hints,
-                objectives,
-            )
-            llm_normalizations_applied = normalization_count
-            refined_flows, llm_dropped = _quality_filter(refined_flows, req)
-            if refined_flows:
-                candidate_flows = refined_flows
-                source = "llm_refined"
-                fallback_reason = ""
-            elif mode == FlowGenerationMode.LLM_FIRST:
-                fallback_reason = "llm_output_failed_quality_gates"
-            if llm_dropped:
-                logger.warning("flow.generate.llm_quality_dropped count=%s", len(llm_dropped))
-        except Exception as exc:
-            logger.warning("flow.generate.llm_fallback reason=%s", exc)
-            fallback_reason = str(exc)
-    elif mode == FlowGenerationMode.LLM_FIRST and not api_key_present:
-        logger.warning("flow.generate.llm_first_without_key")
+        if llm_should_run and api_key_present:
+            llm_attempted = True
+            try:
+                refined_flows, normalization_count = await _llm_refine_flows(
+                    parsed_api,
+                    req,
+                    deterministic_flows,
+                    dependency_hints,
+                    objectives,
+                )
+                llm_normalizations_applied = normalization_count
+                candidate_flows_reviewed = len(refined_flows)
+                reviewed_flows, eliminated_flows, reviewer_applied = await _review_candidate_flows(
+                    parsed_api,
+                    req,
+                    refined_flows,
+                )
+                reviewer_mode = "static_llm" if reviewer_applied else None
+                if reviewed_flows:
+                    candidate_flows = reviewed_flows
+                    source = "llm_refined"
+                    fallback_reason = ""
+                else:
+                    fallback_reason = "llm_candidates_eliminated_by_reviewer"
+            except Exception as exc:
+                logger.warning("flow.generate.llm_fallback reason=%s", exc)
+                fallback_reason = str(exc)
+        elif mode == FlowGenerationMode.LLM_FIRST and not api_key_present:
+            logger.warning("flow.generate.llm_first_without_key")
 
-    created_at = datetime.utcnow()
-    finalized = _finalize_flows(candidate_flows, req, flow_generation_id, created_at)
+        finalized = _finalize_flows(candidate_flows, req, flow_generation_id, created_at)
 
-    if not finalized and deterministic_flows:
-        finalized = _finalize_flows(deterministic_flows, req, flow_generation_id, created_at)
-        source = "deterministic_fallback"
-        if not fallback_reason:
-            fallback_reason = "empty_llm_output"
+        if source != "llm_refined" and not finalized and deterministic_flows:
+            finalized = _finalize_flows(deterministic_flows, req, flow_generation_id, created_at)
+            source = "deterministic_fallback"
+            if not fallback_reason:
+                fallback_reason = "empty_llm_output"
 
-    if not finalized:
-        # Last safety net from first endpoints.
-        fallback_seed = _build_seed_flows(parsed_api, req, ["core api workflow"], dependency_hints)
-        fallback_seed, _dropped = _quality_filter(fallback_seed, req)
-        finalized = _finalize_flows(fallback_seed, req, flow_generation_id, created_at)
-        source = "deterministic_fallback"
-        if not fallback_reason:
-            fallback_reason = "quality_filter_removed_all_flows"
+        if source != "llm_refined" and not finalized:
+            fallback_seed = _build_seed_flows(parsed_api, req, ["core api workflow"], dependency_hints)
+            fallback_seed, _dropped = _quality_filter(fallback_seed, req)
+            finalized = _finalize_flows(fallback_seed, req, flow_generation_id, created_at)
+            source = "deterministic_fallback"
+            if not fallback_reason:
+                fallback_reason = "quality_filter_removed_all_flows"
 
     negative_flows_added = 0
     negative_generation_skipped_reason: str | None = None
-    finalized, negative_flows_added, negative_generation_skipped_reason = _inject_negative_step(
-        finalized,
-        parsed_api,
-        req,
-    )
+    if finalized:
+        finalized, negative_flows_added, negative_generation_skipped_reason = _inject_negative_step(
+            finalized,
+            parsed_api,
+            req,
+        )
+
+    fallback_used = False
+    if mode in {FlowGenerationMode.LLM_FIRST, FlowGenerationMode.HYBRID_AUTO}:
+        fallback_used = source != "llm_refined"
 
     summary = {
         "flows_generated": len(finalized),
         "source": source,
-        "fallback_used": source != "llm_refined",
+        "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "dependency_hints_count": len(dependency_hints),
         "openapi_link_hints_count": sum(1 for hint in dependency_hints if hint.get("kind") == "openapi_link"),
@@ -1627,6 +2077,11 @@ async def generate_flows(
         "deterministic_quality_dropped": len(deterministic_dropped),
         "llm_attempted": llm_attempted,
         "llm_normalizations_applied": llm_normalizations_applied,
+        "candidate_flows_reviewed": candidate_flows_reviewed,
+        "eliminated_flows_count": len(eliminated_flows),
+        "eliminated_flows": [item.model_dump() for item in eliminated_flows],
+        "reviewer_applied": reviewer_applied,
+        "reviewer_mode": reviewer_mode,
         "negative_flows_added": negative_flows_added,
         "negative_generation_skipped_reason": negative_generation_skipped_reason,
         "batch_created_at": created_at.isoformat(),

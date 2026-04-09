@@ -75,7 +75,7 @@ Implemented in `backend/flows/generator.py`.
 Generation has two layers:
 
 1. **Deterministic seed generation (rule-based)**
-2. **Optional AI refinement (Gemini)**
+2. **AI generation / refinement (Gemini)**
 
 Deterministic generation is not tied to fixed URLs. It reads OpenAPI structure and uses common API patterns:
 
@@ -89,7 +89,24 @@ So it can connect different APIs by dependency, for example:
 - step 1 extracts `order_id`
 - step 2 reuses `{{ctx.order_id}}` in `/orders/{orderId}`
 
-If `GEMINI_API_KEY` is available and mode allows, AI refines the generated flows. If AI fails, deterministic fallback is used.
+Flow generation modes:
+
+- `deterministic_first`: only seed-based flows
+- `hybrid_auto` / `llm_first`: deterministic seeds are built first, then AI refines them
+- `pure_llm`: AI generates candidate flows directly from OpenAPI context, without seed-flow scaffolding
+
+Why `source=llm_refined` can appear when `llm_first` is selected:
+
+- `llm_first` is the requested mode
+- `llm_refined` is the final source of the saved flows after the LLM path succeeds
+
+Reviewer gate:
+
+- AI-generated candidates are checked by static rules plus a reviewer LLM pass
+- broken candidates are eliminated before saving
+- the UI shows eliminated flow names and reasons
+
+If `pure_llm` produces zero accepted flows, the system returns reviewer feedback instead of silently falling back to deterministic flows.
 
 ### Execution
 
@@ -127,7 +144,8 @@ Flow run output includes:
 AI is used in generation, not in execution:
 
 - `/api/generate`: AI plans test artifacts (including load scenario drafts)
-- `/api/flows/generate`: AI can refine deterministic flow candidates
+- `/api/flows/generate`: AI can refine seed flows or generate direct `pure_llm` candidates
+- reviewer stage: AI can review generated flow candidates and reject broken ones
 
 Execution itself is deterministic runtime code (`k6` and HTTP step runner).
 
@@ -148,7 +166,10 @@ Execution itself is deterministic runtime code (`k6` and HTTP step runner).
 
 1. Parse an OpenAPI spec first (Dashboard parse).
 2. Open `/flows`.
-3. Generate flows (`deterministic_first` for stable demo, or `hybrid_auto` if key exists).
+3. Generate flows:
+   - `deterministic_first` for a stable demo
+   - `llm_first` to show AI refinement
+   - `pure_llm` to show direct AI generation + reviewer elimination
 4. Run selected flow(s).
 5. Show step trace:
    - resolved request
@@ -176,7 +197,7 @@ Main database tables:
 
 ## 8) Known limitations (brief)
 
-- Some flow generation controls exist in request/UI but are lightly used (`include_negative`).
+- `pure_llm` is more flexible, but still depends on OpenAPI quality and response examples.
 - Long runs use blocking operations inside async routes (can reduce concurrency).
 - Base URL override behavior may be surprising for APIs hosted under nested base paths.
 - k6 script files are persisted in `k6-scripts/` unless manually cleaned.
@@ -188,5 +209,5 @@ Main database tables:
 - The system has two complementary modes:
   - **Load tests** answer: "How does API perform under traffic?"
   - **Flow tests** answer: "Does the real multi-step user journey work correctly?"
-- Flow creation is **deterministic first**, optionally **AI-refined**.
+- Flow creation can be **deterministic**, **AI-refined**, or **pure LLM with reviewer filtering**.
 - Execution is fully runtime code with persisted, auditable traces.

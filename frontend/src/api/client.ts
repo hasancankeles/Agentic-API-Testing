@@ -191,7 +191,8 @@ export interface LoadTestRunResponse {
 export type FlowGenerationMode =
   | 'hybrid_auto'
   | 'llm_first'
-  | 'deterministic_first';
+  | 'deterministic_first'
+  | 'pure_llm';
 
 export type FlowMutationPolicy =
   | 'safe'
@@ -261,6 +262,12 @@ export interface FlowGenerateRequest {
   personas?: string[];
 }
 
+export interface EliminatedFlowCandidate {
+  name: string;
+  reason_code: string;
+  reason: string;
+}
+
 export interface FlowGenerationSummary {
   flows_generated: number;
   source: string;
@@ -274,6 +281,11 @@ export interface FlowGenerationSummary {
   deterministic_quality_dropped?: number;
   llm_attempted?: boolean;
   llm_normalizations_applied?: number;
+  candidate_flows_reviewed?: number;
+  eliminated_flows_count?: number;
+  eliminated_flows?: EliminatedFlowCandidate[];
+  reviewer_applied?: boolean;
+  reviewer_mode?: 'static_llm' | string | null;
   negative_flows_added?: number;
   negative_generation_skipped_reason?: string | null;
   batch_created_at: string;

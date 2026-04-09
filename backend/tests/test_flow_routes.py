@@ -91,6 +91,11 @@ class FlowRouteTests(TestCase):
             "openapi_link_hints_count": 0,
             "llm_attempted": False,
             "llm_normalizations_applied": 0,
+            "candidate_flows_reviewed": 0,
+            "eliminated_flows_count": 0,
+            "eliminated_flows": [],
+            "reviewer_applied": False,
+            "reviewer_mode": None,
             "negative_flows_added": 0,
             "negative_generation_skipped_reason": "disabled",
             "batch_created_at": datetime.utcnow().isoformat(),
@@ -101,7 +106,7 @@ class FlowRouteTests(TestCase):
             self.assertEqual(parse_res.status_code, 200)
 
             with patch("main.generate_flows", AsyncMock(return_value=([flow], flow_summary))):
-                generate_res = client.post("/api/flows/generate", json={"max_flows": 2})
+                generate_res = client.post("/api/flows/generate", json={"max_flows": 2, "generation_mode": "pure_llm"})
 
             self.assertEqual(generate_res.status_code, 200)
             body = generate_res.json()
@@ -109,6 +114,10 @@ class FlowRouteTests(TestCase):
             self.assertEqual(len(body["flows"]), 1)
             self.assertIn("llm_attempted", body["summary"])
             self.assertIn("llm_normalizations_applied", body["summary"])
+            self.assertIn("candidate_flows_reviewed", body["summary"])
+            self.assertIn("eliminated_flows_count", body["summary"])
+            self.assertIn("eliminated_flows", body["summary"])
+            self.assertIn("reviewer_applied", body["summary"])
             self.assertIn("negative_flows_added", body["summary"])
             flow_id = body["flows"][0]["id"]
 
@@ -141,6 +150,11 @@ class FlowRouteTests(TestCase):
             "openapi_link_hints_count": 0,
             "llm_attempted": False,
             "llm_normalizations_applied": 0,
+            "candidate_flows_reviewed": 0,
+            "eliminated_flows_count": 0,
+            "eliminated_flows": [],
+            "reviewer_applied": False,
+            "reviewer_mode": None,
             "negative_flows_added": 0,
             "negative_generation_skipped_reason": "disabled",
             "batch_created_at": datetime.utcnow().isoformat(),

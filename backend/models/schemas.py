@@ -456,6 +456,7 @@ class FlowGenerationMode(str, Enum):
     HYBRID_AUTO = "hybrid_auto"
     LLM_FIRST = "llm_first"
     DETERMINISTIC_FIRST = "deterministic_first"
+    PURE_LLM = "pure_llm"
 
 
 class FlowMutationPolicy(str, Enum):
@@ -545,6 +546,12 @@ class FlowScenario(BaseModel):
         if ordered != sorted(ordered):
             raise ValueError("Flow steps must be ordered by ascending step.order")
         return self
+
+
+class FlowEliminatedCandidate(BaseModel):
+    name: str
+    reason_code: str
+    reason: str
 
 
 class FlowStepResult(BaseModel):

@@ -287,6 +287,9 @@ export default function FlowTests() {
     () => analyzeFallbackReason(generationSummary?.fallback_reason ?? ""),
     [generationSummary]
   );
+  const pureLLMRejectedAll =
+    generationSummary?.generation_mode === "pure_llm" &&
+    generationSummary.flows_generated === 0;
 
   const applySuggestionChip = (action: SuggestionChip["action"]) => {
     if (action === "deterministic_first") {
@@ -424,11 +427,15 @@ export default function FlowTests() {
       const res = await generateFlows(payload);
       const data = unwrap(res.data);
       setGenerationSummary(data.summary);
-      await fetchFlows();
       if (data.flows.length > 0) {
+        await fetchFlows();
         const firstFlow = data.flows[0];
         setSelectedFlowId(firstFlow.id);
         setSelectedFlow(firstFlow);
+      } else {
+        setSelectedFlowId(null);
+        setSelectedFlow(null);
+        setSelectedFlowIds([]);
       }
     } catch (error) {
       setGenerateError(extractErrorMessage(error, "Failed to generate flows."));
@@ -589,6 +596,7 @@ export default function FlowTests() {
                 <option value="hybrid_auto">hybrid_auto</option>
                 <option value="llm_first">llm_first</option>
                 <option value="deterministic_first">deterministic_first</option>
+                <option value="pure_llm">pure_llm</option>
               </select>
             </label>
 
@@ -657,9 +665,14 @@ export default function FlowTests() {
               <h3 className="mb-3 text-sm font-medium text-zinc-300">
                 Last generation summary
               </h3>
+              {pureLLMRejectedAll && (
+                <div className="mb-3 rounded-lg border border-red-800/70 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                  Pure LLM generation produced no accepted flows. Reviewer feedback is shown below.
+                </div>
+              )}
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <div>
-                  <p className="text-xs text-zinc-500">Source</p>
+                  <p className="text-xs text-zinc-500">Final source</p>
                   <p className="text-sm text-zinc-200">{generationSummary.source}</p>
                 </div>
                 <div>
@@ -687,7 +700,7 @@ export default function FlowTests() {
                   </p>
                 </div>
                 <div>
-                  <p className="text-xs text-zinc-500">Generation mode</p>
+                  <p className="text-xs text-zinc-500">Requested mode</p>
                   <p className="text-sm text-zinc-200">
                     {generationSummary.generation_mode ?? "—"}
                   </p>
@@ -717,7 +730,31 @@ export default function FlowTests() {
                   </p>
                 </div>
                 <div>
-                  <p className="text-xs text-zinc-500">Negative flows added</p>
+                  <p className="text-xs text-zinc-500">Candidates reviewed</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.candidate_flows_reviewed ?? 0}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">Eliminated flows</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.eliminated_flows_count ?? 0}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">Reviewer applied</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.reviewer_applied ? "yes" : "no"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">Reviewer mode</p>
+                  <p className="text-sm text-zinc-200">
+                    {generationSummary.reviewer_mode ?? "—"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-zinc-500">Negative steps added</p>
                   <p className="text-sm text-zinc-200">
                     {generationSummary.negative_flows_added ?? 0}
                   </p>
@@ -769,6 +806,33 @@ export default function FlowTests() {
                   )}
                 </div>
               )}
+              {generationSummary.eliminated_flows &&
+                generationSummary.eliminated_flows.length > 0 && (
+                  <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <p className="text-sm font-medium text-zinc-200">
+                        Eliminated flows
+                      </p>
+                      <span className="text-xs text-zinc-500">
+                        {generationSummary.eliminated_flows.length} rejected
+                      </span>
+                    </div>
+                    <div className="space-y-2">
+                      {generationSummary.eliminated_flows.map((item, index) => (
+                        <div
+                          key={`${item.name}:${item.reason_code}:${index}`}
+                          className="rounded border border-zinc-800 bg-zinc-950/60 px-3 py-2"
+                        >
+                          <p className="text-sm text-zinc-100">{item.name}</p>
+                          <p className="mt-1 text-xs uppercase tracking-wide text-red-300">
+                            {item.reason_code}
+                          </p>
+                          <p className="mt-1 text-sm text-zinc-400">{item.reason}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               {generationSummary.negative_generation_skipped_reason && (
                 <p className="mt-2 text-sm text-amber-400">
                   Negative generation skipped: {generationSummary.negative_generation_skipped_reason}
