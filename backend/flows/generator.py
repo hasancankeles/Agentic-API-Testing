@@ -37,6 +37,7 @@ FLOW_CRITIC_MODEL = os.getenv("FLOW_CRITIC_MODEL", FLOW_PLANNER_MODEL)
 FLOW_REVIEWER_MODEL = os.getenv("FLOW_REVIEWER_MODEL", FLOW_CRITIC_MODEL)
 
 _TEMPLATE_VAR_PATTERN = re.compile(r"\{\{\s*ctx\.([a-zA-Z0-9_.-]+)\s*\}\}")
+_FULL_CTX_TEMPLATE_PATTERN = re.compile(r"^\{\{\s*ctx\.([a-zA-Z0-9_.-]+)\s*\}\}$")
 _PATH_PARAM_PATTERN = re.compile(r"\{([^{}]+)\}")
 _AUTH_KEYWORDS = {"login", "signin", "auth", "token", "session", "oauth"}
 _INTERACTION_KEYWORDS = {"like", "comment", "vote", "react", "follow", "share"}
@@ -238,7 +239,84 @@ def _normalize_extract_entry(entry: object) -> tuple[dict | None, int]:
     return normalized, changed
 
 
-def _normalize_llm_flow_payload(raw_flow: dict) -> tuple[dict, int]:
+def _normalize_path_params_from_endpoint(
+    parsed_api: ParsedAPI,
+    method_value: object,
+    endpoint_value: object,
+    path_params_value: object,
+) -> tuple[object, object, int]:
+    if not isinstance(endpoint_value, str):
+        return endpoint_value, path_params_value, 0
+
+    endpoint = endpoint_value.strip()
+    if "{{ctx." not in endpoint:
+        return endpoint_value, path_params_value, 0
+
+    try:
+        method = HttpMethod(str(method_value).upper())
+    except Exception:
+        method = HttpMethod.GET
+
+    raw_path = endpoint
+    if raw_path.startswith(("http://", "https://")):
+        parsed = urlparse(raw_path)
+        raw_path = parsed.path or "/"
+    if not raw_path.startswith("/"):
+        raw_path = f"/{raw_path}"
+
+    raw_parts = [part for part in raw_path.split("/") if part]
+    candidates = [
+        candidate
+        for candidate in parsed_api.endpoints
+        if candidate.method == method
+        and len([part for part in candidate.path.split("/") if part]) == len(raw_parts)
+    ]
+
+    best_match: tuple[ParsedEndpoint, dict[str, object]] | None = None
+    best_score = -1
+    for candidate in candidates:
+        candidate_parts = [part for part in candidate.path.split("/") if part]
+        mapped_path_params: dict[str, object] = {}
+        score = 0
+        valid = True
+        for raw_part, candidate_part in zip(raw_parts, candidate_parts, strict=False):
+            if raw_part == candidate_part:
+                score += 2
+                continue
+            if candidate_part.startswith("{") and candidate_part.endswith("}"):
+                param_name = candidate_part[1:-1]
+                full_ctx_match = _FULL_CTX_TEMPLATE_PATTERN.match(raw_part)
+                if full_ctx_match:
+                    mapped_path_params[param_name] = raw_part
+                    score += 3
+                    continue
+                if raw_part:
+                    mapped_path_params[param_name] = raw_part
+                    score += 1
+                    continue
+            valid = False
+            break
+        if valid and score > best_score and mapped_path_params:
+            best_score = score
+            best_match = (candidate, mapped_path_params)
+
+    if best_match is None:
+        return endpoint_value, path_params_value, 0
+
+    candidate, mapped_path_params = best_match
+    normalized_path_params = (
+        dict(path_params_value) if isinstance(path_params_value, dict) else {}
+    )
+    changed = 1 if candidate.path != endpoint_value else 0
+    for key, value in mapped_path_params.items():
+        if normalized_path_params.get(key) != value:
+            normalized_path_params[key] = value
+            changed = 1
+
+    return candidate.path, normalized_path_params, changed
+
+
+def _normalize_llm_flow_payload(raw_flow: dict, parsed_api: ParsedAPI | None = None) -> tuple[dict, int]:
     if not isinstance(raw_flow, dict):
         return raw_flow, 0
 
@@ -255,6 +333,17 @@ def _normalize_llm_flow_payload(raw_flow: dict) -> tuple[dict, int]:
             continue
 
         step = dict(raw_step)
+        if parsed_api is not None:
+            normalized_endpoint, normalized_path_params, changed = _normalize_path_params_from_endpoint(
+                parsed_api,
+                step.get("method"),
+                step.get("endpoint"),
+                step.get("path_params", {}),
+            )
+            if changed:
+                step["endpoint"] = normalized_endpoint
+                step["path_params"] = normalized_path_params
+                normalizations += changed
         raw_extract = raw_step.get("extract")
         if isinstance(raw_extract, dict):
             raw_extract = [raw_extract]
@@ -863,6 +952,23 @@ def _prune_steps_for_mutation_policy(steps: list[FlowStep], mutation_policy: Flo
     return result
 
 
+def _flow_step_is_auth_like(step: FlowStep) -> bool:
+    combined = " ".join(
+        [
+            step.name,
+            step.endpoint,
+            str(step.body),
+            " ".join(rule.var for rule in step.extract),
+        ]
+    ).lower()
+    if any(token in combined for token in _AUTH_KEYWORDS):
+        return True
+    if any("token" in rule.var.lower() for rule in step.extract):
+        return True
+    header_names = {str(key).lower() for key in step.headers.keys()}
+    return bool({"authorization", "x-api-key", "api_key"} & header_names)
+
+
 def _flow_quality_errors(flow: FlowScenario, req: FlowGenerateRequest) -> list[str]:
     errors: list[str] = []
     sorted_steps = sorted(flow.steps, key=lambda step: step.order)
@@ -891,7 +997,12 @@ def _flow_quality_errors(flow: FlowScenario, req: FlowGenerateRequest) -> list[s
         known_vars.update(produced)
 
     mutating_methods = {HttpMethod.POST, HttpMethod.PUT, HttpMethod.PATCH, HttpMethod.DELETE}
-    has_mutation = any(step.method in mutating_methods for step in sorted_steps)
+    business_mutations = [
+        step
+        for step in sorted_steps
+        if step.method in mutating_methods and not _flow_step_is_auth_like(step)
+    ]
+    has_mutation = bool(business_mutations)
     if has_mutation and not any(step.method == HttpMethod.GET for step in sorted_steps):
         errors.append("flow missing read-after-write verification GET step")
 
@@ -900,7 +1011,7 @@ def _flow_quality_errors(flow: FlowScenario, req: FlowGenerateRequest) -> list[s
         if delete_count > 0:
             errors.append("safe mutation policy forbids DELETE steps")
 
-        mutation_count = sum(1 for step in sorted_steps if step.method in mutating_methods)
+        mutation_count = len(business_mutations)
         if mutation_count > max(1, len(sorted_steps) // 2):
             errors.append("safe mutation policy exceeded mutation ratio")
 
@@ -1576,6 +1687,9 @@ async def _llm_compose_flows(
             "Hard rules:",
             "- Keep only HTTP steps.",
             "- Endpoint must be normalized relative path.",
+            "- Keep endpoint path templates exactly as declared in the OpenAPI spec.",
+            "- Never place {{ctx.var}} directly inside endpoint strings.",
+            "- Put dynamic path values only in path_params, for example endpoint=/booking/{id} and path_params={\"id\": \"{{ctx.booking_id}}\"}.",
             "- Use {{ctx.var}} for dependencies.",
             "- Every mutating flow should include a verification read step.",
             "- Respect mutation policy and max steps.",
@@ -1608,7 +1722,7 @@ async def _llm_compose_flows(
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
-        normalized_item, normalizations = _normalize_llm_flow_payload(item)
+        normalized_item, normalizations = _normalize_llm_flow_payload(item, parsed_api)
         total_normalizations += normalizations
         validated.append(FlowScenario.model_validate(normalized_item))
 
@@ -1619,6 +1733,7 @@ async def _llm_compose_flows(
 
 async def _llm_critic_repair(
     client: genai.Client,
+    parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
     flows: list[FlowScenario],
 ) -> tuple[list[FlowScenario], int]:
@@ -1659,6 +1774,7 @@ async def _llm_critic_repair(
             json.dumps(contract, ensure_ascii=True, indent=2),
             "Review and repair flows to satisfy:",
             "- No unresolved path params.",
+            "- Endpoint strings must keep OpenAPI path templates; move dynamic values into path_params.",
             "- No broken ctx variable dependencies.",
             "- Ordered state progression (extract -> reuse -> verify).",
             "- Mutating flows include read verification.",
@@ -1678,7 +1794,7 @@ async def _llm_critic_repair(
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
-        normalized_item, normalizations = _normalize_llm_flow_payload(item)
+        normalized_item, normalizations = _normalize_llm_flow_payload(item, parsed_api)
         total_normalizations += normalizations
         validated.append(FlowScenario.model_validate(normalized_item))
 
@@ -1738,9 +1854,13 @@ async def _llm_generate_candidate_flows(
             "Hard rules:",
             "- Use only operations that exist in the API context.",
             "- Endpoint must be a normalized relative path, never a full URL.",
+            "- Keep endpoint path templates exactly as declared in the OpenAPI spec.",
+            "- Never place {{ctx.var}} directly inside endpoint strings.",
+            "- Put dynamic path values only in path_params, for example endpoint=/booking/{id} and path_params={\"id\": \"{{ctx.booking_id}}\"}.",
             "- Use {{ctx.var}} only when an earlier step extracts that variable or it exists in app_context.",
             "- Prefer distinct workflows with 3+ steps when the API supports them.",
             "- Every mutating flow should include a verification read step when possible.",
+            "- Under safe mutation policy, keep only minimal business mutations; authentication should be separate from business write steps.",
             "- Do not invent auth tokens or body fields that are not supported by response content types or examples.",
             "- Respect mutation policy, include_negative separately, and max steps.",
             "Request preferences:",
@@ -1777,7 +1897,7 @@ async def _llm_generate_candidate_flows(
                 )
             )
             continue
-        normalized_item, normalizations = _normalize_llm_flow_payload(item)
+        normalized_item, normalizations = _normalize_llm_flow_payload(item, parsed_api)
         total_normalizations += normalizations
         try:
             validated.append(FlowScenario.model_validate(normalized_item))
@@ -1929,7 +2049,7 @@ async def _llm_refine_flows(
             scenarios,
             dependency_hints,
         )
-        criticized, critic_normalizations = await _llm_critic_repair(client, req, composed)
+        criticized, critic_normalizations = await _llm_critic_repair(client, parsed_api, req, composed)
         return criticized, compose_normalizations + critic_normalizations
     except genai_errors.APIError as exc:
         raise FlowGeneratorError(f"flow planner upstream error: {exc}") from exc

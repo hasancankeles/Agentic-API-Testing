@@ -284,6 +284,50 @@ paths:
         errors = _flow_quality_errors(flow, FlowGenerateRequest())
         self.assertTrue(any("read-after-write verification" in error for error in errors))
 
+    def test_quality_gate_safe_policy_ignores_auth_step_as_business_mutation(self) -> None:
+        flow = FlowScenario(
+            id="quality_3",
+            name="Auth then patch",
+            steps=[
+                FlowStep(
+                    step_id="list",
+                    order=1,
+                    name="List bookings",
+                    method=HttpMethod.GET,
+                    endpoint="/booking",
+                    extract=[{"var": "booking_id", "from": "body", "path": "0.bookingid", "required": True}],
+                    expected_status=200,
+                ),
+                FlowStep(
+                    step_id="auth",
+                    order=2,
+                    name="Authenticate",
+                    method=HttpMethod.POST,
+                    endpoint="/auth",
+                    body={"username": "admin", "password": "password123"},
+                    extract=[{"var": "auth_token", "from": "body", "path": "token", "required": True}],
+                    expected_status=200,
+                ),
+                FlowStep(
+                    step_id="patch",
+                    order=3,
+                    name="Patch booking",
+                    method=HttpMethod.PATCH,
+                    endpoint="/booking/{id}",
+                    path_params={"id": "{{ctx.booking_id}}"},
+                    headers={"Authorization": "Bearer {{ctx.auth_token}}"},
+                    body={"firstname": "Updated"},
+                    expected_status=200,
+                ),
+            ],
+        )
+
+        errors = _flow_quality_errors(
+            flow,
+            FlowGenerateRequest(mutation_policy=FlowMutationPolicy.SAFE),
+        )
+        self.assertFalse(any("mutation ratio" in error for error in errors))
+
     async def test_auth_required_api_generates_auth_aware_steps(self) -> None:
         parsed_api = parse_openapi(
             """
@@ -519,6 +563,82 @@ paths:
         self.assertEqual(flows, [])
         self.assertEqual(len(schema_invalid), 1)
         self.assertEqual(schema_invalid[0].reason_code, "schema_invalid")
+
+    async def test_pure_llm_normalizes_embedded_ctx_path_segments(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Booking API
+  version: "1.0"
+servers:
+  - url: https://example.com
+paths:
+  /booking:
+    post:
+      responses:
+        "200":
+          description: ok
+  /booking/{id}:
+    put:
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+"""
+        )
+        payload = {
+            "flows": [
+                {
+                    "name": "Booking update",
+                    "description": "embedded ctx path segment",
+                    "persona": "tester",
+                    "preconditions": [],
+                    "tags": ["booking"],
+                    "steps": [
+                        {
+                            "step_id": "create",
+                            "order": 1,
+                            "name": "Create booking",
+                            "method": "POST",
+                            "endpoint": "/booking",
+                            "extract": [{"var": "booking_id", "from": "body", "path": "bookingid", "required": True}],
+                            "expected_status": 200,
+                            "required": True,
+                        },
+                        {
+                            "step_id": "update",
+                            "order": 2,
+                            "name": "Update booking",
+                            "method": "PUT",
+                            "endpoint": "/booking/{{ctx.booking_id}}",
+                            "path_params": {},
+                            "expected_status": 200,
+                            "required": True,
+                        },
+                    ],
+                }
+            ]
+        }
+
+        with patch("flows.generator._llm_json_call", return_value=payload):
+            flows, normalizations, _schema_invalid = await _llm_generate_candidate_flows(
+                client=object(),
+                parsed_api=parsed_api,
+                req=FlowGenerateRequest(generation_mode=FlowGenerationMode.PURE_LLM),
+                objectives=["update and verify workflow"],
+                dependency_hints=[],
+            )
+
+        self.assertEqual(len(flows), 1)
+        self.assertGreater(normalizations, 0)
+        step = flows[0].steps[1]
+        self.assertEqual(step.endpoint, "/booking/{id}")
+        self.assertEqual(step.path_params, {"id": "{{ctx.booking_id}}"})
 
     async def test_pure_llm_returns_zero_flows_without_deterministic_fallback(self) -> None:
         parsed_api = parse_openapi(
