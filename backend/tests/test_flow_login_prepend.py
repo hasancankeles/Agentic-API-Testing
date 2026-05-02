@@ -235,6 +235,9 @@ class InjectLoginPrependTests(TestCase):
         login_extract_vars = {rule.var for rule in steps[1].extract}
         self.assertIn("auth_token", login_extract_vars)
 
+        # Templated register must also be soft so repeat runs don't 409-block.
+        self.assertFalse(steps[0].required)
+
         # Register and login bodies should reference the same templated identifiers
         # so they target the same just-registered user.
         self.assertEqual(steps[0].body.get("email"), steps[1].body.get("email"))
@@ -394,6 +397,12 @@ paths:
         # creates is exactly the one login then tries to authenticate.
         self.assertEqual(steps[0].body.get("email"), invented_body["email"])
         self.assertEqual(steps[0].body.get("password"), invented_body["password"])
+
+        # The prepended register must be soft so a 409 "Email already
+        # registered" on a repeat run does not block the subsequent login.
+        self.assertFalse(steps[0].required)
+        self.assertEqual(steps[0].assertions, [])
+        self.assertIsNone(steps[0].expected_status)
 
     def test_no_changes_when_login_and_register_both_present(self) -> None:
         parsed_api = _parse(SPEC_WITH_LOGIN_AND_REGISTER)

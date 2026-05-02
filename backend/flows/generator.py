@@ -1589,13 +1589,26 @@ def _build_auth_step(
     *,
     step_id: str,
     name: str,
+    soft: bool = False,
 ) -> FlowStep:
+    """Build a synthetic register/login step.
+
+    When ``soft=True``, the step is non-blocking and tolerant of any HTTP
+    status — used for prepended register steps so a 409 "user already exists"
+    on a second run does not stop the subsequent login from running.
+    """
+
     io_meta = _build_endpoint_io([endpoint])[_endpoint_key(endpoint)]
     base = _build_step(endpoint, io_meta, order, set(_DEFAULT_EXTERNAL_CTX_VARS), FlowGenerateRequest())
     body = dict(base.body) if isinstance(base.body, dict) else {}
     for field, value in credentials.items():
         body[field] = value
-    return base.model_copy(update={"step_id": step_id, "name": name, "body": body})
+    update: dict[str, object] = {"step_id": step_id, "name": name, "body": body}
+    if soft:
+        update["required"] = False
+        update["assertions"] = []
+        update["expected_status"] = None
+    return base.model_copy(update=update)
 
 
 def _inject_login_prepend(
@@ -1664,7 +1677,8 @@ def _inject_login_prepend(
                 existing_login.order,  # placeholder; renumbered below
                 login_body,
                 step_id="auto_register",
-                name="Register test user",
+                name="Register test user (idempotent)",
+                soft=True,
             )
 
             new_steps: list[FlowStep] = []
@@ -1707,7 +1721,8 @@ def _inject_login_prepend(
                     next_order,
                     credentials,
                     step_id="auto_register",
-                    name="Register test user",
+                    name="Register test user (idempotent)",
+                    soft=True,
                 )
             )
             next_order += 1
