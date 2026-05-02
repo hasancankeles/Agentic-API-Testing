@@ -1497,6 +1497,243 @@ def _build_negative_validation_step(
     )
 
 
+_LOGIN_KEYWORDS = ("login", "signin", "sign_in", "sign-in")
+_REGISTER_KEYWORDS = ("register", "signup", "sign_up", "sign-up")
+
+
+def _endpoint_matches_keywords(endpoint: ParsedEndpoint, keywords: tuple[str, ...]) -> bool:
+    haystack = " ".join(
+        [
+            endpoint.path,
+            endpoint.operation_id,
+            endpoint.summary,
+            endpoint.description,
+            " ".join(endpoint.tags),
+        ]
+    ).lower()
+    return any(keyword in haystack for keyword in keywords)
+
+
+def _find_auth_endpoint(parsed_api: ParsedAPI, keywords: tuple[str, ...]) -> ParsedEndpoint | None:
+    for endpoint in parsed_api.endpoints:
+        if endpoint.method != HttpMethod.POST:
+            continue
+        if _endpoint_matches_keywords(endpoint, keywords):
+            return endpoint
+    return None
+
+
+def _flow_has_auth_producer(flow: FlowScenario) -> bool:
+    for step in flow.steps:
+        for rule in step.extract:
+            if rule.var in {"auth_token", "access_token"}:
+                return True
+    return False
+
+
+def _find_step_matching_endpoint(
+    flow: FlowScenario,
+    target_endpoint: ParsedEndpoint | None,
+    parsed_api: ParsedAPI,
+) -> FlowStep | None:
+    if target_endpoint is None:
+        return None
+    target_path = _normalize_path(target_endpoint.path, parsed_api.base_url)
+    for step in flow.steps:
+        if step.method != target_endpoint.method:
+            continue
+        if _normalize_path(step.endpoint, parsed_api.base_url) == target_path:
+            return step
+    return None
+
+
+def _flow_consumes_auth(flow: FlowScenario) -> bool:
+    auth_var_tokens = ("{{ctx.auth_token}}", "{{ctx.access_token}}")
+    for step in flow.steps:
+        for value in step.headers.values():
+            if isinstance(value, str) and any(token in value for token in auth_var_tokens):
+                return True
+    return False
+
+
+def _flow_targets_auth_required_endpoint(flow: FlowScenario, parsed_api: ParsedAPI) -> bool:
+    lookup = _endpoint_lookup(parsed_api)
+    for step in flow.steps:
+        endpoint_path = _normalize_path(step.endpoint, parsed_api.base_url)
+        endpoint = lookup.get((step.method, endpoint_path))
+        if endpoint is None:
+            continue
+        if endpoint.requires_auth and not _is_auth_endpoint(endpoint):
+            return True
+    return False
+
+
+def _credentials_from_app_context(app_context: dict) -> tuple[str, str] | None:
+    auth = app_context.get("auth") if isinstance(app_context, dict) else None
+    if not isinstance(auth, dict):
+        return None
+    test_user = auth.get("test_user")
+    if not isinstance(test_user, dict):
+        return None
+    email = test_user.get("email")
+    password = test_user.get("password")
+    if isinstance(email, str) and isinstance(password, str) and email and password:
+        return email, password
+    return None
+
+
+def _build_auth_step(
+    endpoint: ParsedEndpoint,
+    order: int,
+    credentials: dict[str, object],
+    *,
+    step_id: str,
+    name: str,
+) -> FlowStep:
+    io_meta = _build_endpoint_io([endpoint])[_endpoint_key(endpoint)]
+    base = _build_step(endpoint, io_meta, order, set(_DEFAULT_EXTERNAL_CTX_VARS), FlowGenerateRequest())
+    body = dict(base.body) if isinstance(base.body, dict) else {}
+    for field, value in credentials.items():
+        body[field] = value
+    return base.model_copy(update={"step_id": step_id, "name": name, "body": body})
+
+
+def _inject_login_prepend(
+    flows: list[FlowScenario],
+    parsed_api: ParsedAPI,
+    req: FlowGenerateRequest,
+) -> tuple[list[FlowScenario], int, dict[str, str]]:
+    """Ensure flows that need auth have a working register+login prefix.
+
+    Three cases per flow:
+      1. Flow has neither login nor register: prepend both (or login alone if
+         `req.app_context.auth.test_user` provides literal credentials, in which
+         case the user is assumed pre-registered).
+      2. Flow has a login step but no register step: prepend register reusing the
+         login step's body, so whatever credentials the LLM put in login get
+         created on the server first.
+      3. Flow already has both (or doesn't need auth): unchanged.
+    """
+
+    if not flows:
+        return flows, 0, {}
+
+    login_endpoint = _find_auth_endpoint(parsed_api, _LOGIN_KEYWORDS)
+    register_endpoint = _find_auth_endpoint(parsed_api, _REGISTER_KEYWORDS)
+
+    updated_flows: list[FlowScenario] = []
+    injected = 0
+    skip_reasons: dict[str, str] = {}
+
+    creds = _credentials_from_app_context(req.app_context)
+    if creds is not None:
+        email_value, password_value = creds
+        prefer_register_for_new_login = False
+    else:
+        email_value = "user_{{ctx.run_id}}@example.com"
+        password_value = "Passw0rd!{{ctx.run_id}}"
+        prefer_register_for_new_login = True
+
+    for flow in flows:
+        flow_id = flow.id or flow.name
+        needs_auth = _flow_targets_auth_required_endpoint(flow, parsed_api) or _flow_consumes_auth(flow)
+        if not needs_auth:
+            updated_flows.append(flow)
+            continue
+
+        existing_login = _find_step_matching_endpoint(flow, login_endpoint, parsed_api)
+        existing_register = _find_step_matching_endpoint(flow, register_endpoint, parsed_api)
+
+        # Case 2: login present but register missing. Prepend register reusing login's body.
+        if existing_login is not None:
+            if existing_register is not None:
+                updated_flows.append(flow)
+                continue
+            if register_endpoint is None:
+                # Spec has no register endpoint — nothing more we can do here.
+                updated_flows.append(flow)
+                continue
+            if len(flow.steps) + 1 > req.max_steps_per_flow:
+                skip_reasons[flow_id] = "max_steps_exceeded"
+                updated_flows.append(flow)
+                continue
+
+            login_body = existing_login.body if isinstance(existing_login.body, dict) else {}
+            register_step = _build_auth_step(
+                register_endpoint,
+                existing_login.order,  # placeholder; renumbered below
+                login_body,
+                step_id="auto_register",
+                name="Register test user",
+            )
+
+            new_steps: list[FlowStep] = []
+            next_order = 1
+            for step in flow.steps:
+                if step.step_id == existing_login.step_id:
+                    new_steps.append(register_step.model_copy(update={"order": next_order}))
+                    next_order += 1
+                new_steps.append(step.model_copy(update={"order": next_order}))
+                next_order += 1
+            updated_flows.append(flow.model_copy(update={"steps": new_steps}))
+            injected += 1
+            continue
+
+        # Case 1: no login step. Prepend login (and register if using templated creds).
+        if _flow_has_auth_producer(flow):
+            # Some other step already produces auth_token (e.g. an OAuth callback);
+            # don't intrude.
+            updated_flows.append(flow)
+            continue
+        if login_endpoint is None:
+            skip_reasons[flow_id] = "no_login_endpoint_in_spec"
+            updated_flows.append(flow)
+            continue
+
+        use_register = prefer_register_for_new_login and register_endpoint is not None
+        prepend_count = 2 if use_register else 1
+        if len(flow.steps) + prepend_count > req.max_steps_per_flow:
+            skip_reasons[flow_id] = "max_steps_exceeded"
+            updated_flows.append(flow)
+            continue
+
+        credentials = {"email": email_value, "password": password_value}
+        prepended_steps: list[FlowStep] = []
+        next_order = 1
+        if use_register:
+            prepended_steps.append(
+                _build_auth_step(
+                    register_endpoint,
+                    next_order,
+                    credentials,
+                    step_id="auto_register",
+                    name="Register test user",
+                )
+            )
+            next_order += 1
+        prepended_steps.append(
+            _build_auth_step(
+                login_endpoint,
+                next_order,
+                credentials,
+                step_id="auto_login",
+                name="Login test user",
+            )
+        )
+        next_order += 1
+
+        renumbered_existing = [
+            step.model_copy(update={"order": next_order + index})
+            for index, step in enumerate(flow.steps)
+        ]
+        updated_flows.append(
+            flow.model_copy(update={"steps": [*prepended_steps, *renumbered_existing]})
+        )
+        injected += 1
+
+    return updated_flows, injected, skip_reasons
+
+
 def _inject_negative_step(
     flows: list[FlowScenario],
     parsed_api: ParsedAPI,
@@ -2171,6 +2408,15 @@ async def generate_flows(
             if not fallback_reason:
                 fallback_reason = "quality_filter_removed_all_flows"
 
+    login_flows_prepended = 0
+    login_prepend_skip_reasons: dict[str, str] = {}
+    if finalized:
+        finalized, login_flows_prepended, login_prepend_skip_reasons = _inject_login_prepend(
+            finalized,
+            parsed_api,
+            req,
+        )
+
     negative_flows_added = 0
     negative_generation_skipped_reason: str | None = None
     if finalized:
@@ -2204,6 +2450,8 @@ async def generate_flows(
         "reviewer_mode": reviewer_mode,
         "negative_flows_added": negative_flows_added,
         "negative_generation_skipped_reason": negative_generation_skipped_reason,
+        "login_flows_prepended": login_flows_prepended,
+        "login_prepend_skip_reasons": login_prepend_skip_reasons,
         "batch_created_at": created_at.isoformat(),
     }
     return finalized, summary
