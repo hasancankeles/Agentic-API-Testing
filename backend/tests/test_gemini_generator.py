@@ -17,13 +17,14 @@ from generator.gemini_generator import (  # noqa: E402
     HttpExecutorJob,
     _normalize_assertions,
     _normalize_endpoint_path,
+    _reconcile_http_cases_with_contract,
     _run_http_executor_queue,
     _sanitize_for_debug,
     StructuredOutputError,
     UpstreamModelError,
     generate_all,
 )
-from models.schemas import ParsedAPI, PlannerTestCaseDraft, TestAssertion, TestCategory  # noqa: E402
+from models.schemas import HttpMethod, ParsedAPI, PlannerTestCaseDraft, TestAssertion, TestCase, TestCategory, TestSuite  # noqa: E402
 from parser.openapi_parser import parse_openapi  # noqa: E402
 
 
@@ -189,6 +190,51 @@ class GeminiGeneratorTests(IsolatedAsyncioTestCase):
         self.assertEqual(normalized[2].operator, "contains")
         self.assertEqual(normalized[3].field, "body.user.name")
         self.assertEqual(normalized[3].operator, "eq")
+
+    def test_reconcile_http_success_status_with_contract(self) -> None:
+        parsed = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Status API
+  version: "1.0"
+paths:
+  /ping:
+    get:
+      responses:
+        "201":
+          description: Created
+"""
+        )
+        suite = TestSuite(
+            name="Individual",
+            category=TestCategory.INDIVIDUAL,
+            test_cases=[
+                TestCase(
+                    name="Ping success",
+                    endpoint="/ping",
+                    method=HttpMethod.GET,
+                    expected_status=200,
+                    assertions=[TestAssertion(field="status_code", operator="eq", expected=200)],
+                    category=TestCategory.INDIVIDUAL,
+                ),
+                TestCase(
+                    name="Ping not found",
+                    endpoint="/ping",
+                    method=HttpMethod.GET,
+                    expected_status=404,
+                    assertions=[TestAssertion(field="status_code", operator="eq", expected=404)],
+                    category=TestCategory.INDIVIDUAL,
+                ),
+            ],
+        )
+
+        _reconcile_http_cases_with_contract([suite], parsed)
+
+        self.assertEqual(suite.test_cases[0].expected_status, 201)
+        self.assertEqual(suite.test_cases[0].assertions[0].expected, 201)
+        self.assertEqual(suite.test_cases[1].expected_status, 404)
+        self.assertEqual(suite.test_cases[1].assertions[0].expected, 404)
 
     async def test_generate_all_success_with_per_case_executor_queue(self) -> None:
         parsed = _parsed_api()

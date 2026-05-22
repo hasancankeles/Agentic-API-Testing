@@ -1,32 +1,23 @@
-import { useEffect, useState, useCallback, Fragment } from "react";
-import {
-  getResults,
-  type TestResult,
-} from "../api/client";
-import StatusBadge from "../components/StatusBadge";
+import { Fragment, useCallback, useEffect, useState } from "react";
+import { Activity, RefreshCw, Search } from "lucide-react";
+import { getResults, type TestResult } from "../api/client";
 import ResponseDiff from "../components/ResponseDiff";
-import type { TestStatus } from "../components/StatusBadge";
-
-const methodStyles: Record<string, string> = {
-  GET: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  POST: "bg-blue-500/20 text-blue-400 border-blue-500/30",
-  PUT: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  DELETE: "bg-red-500/20 text-red-400 border-red-500/30",
-  PATCH: "bg-violet-500/20 text-violet-400 border-violet-500/30",
-};
-
-function MethodBadge({ method }: { method: string }) {
-  const style =
-    methodStyles[method.toUpperCase()] ??
-    "bg-zinc-500/20 text-zinc-400 border-zinc-500/30";
-  return (
-    <span
-      className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-mono font-medium ${style}`}
-    >
-      {method}
-    </span>
-  );
-}
+import {
+  Button,
+  DataTable,
+  EmptyState,
+  Field,
+  InlineAlert,
+  Input,
+  MethodBadge,
+  PageHeader,
+  Panel,
+  Select,
+  StatusBadge,
+  tableCellClass,
+  tableHeaderClass,
+} from "../components/ui";
+import { extractErrorMessage, toStatus } from "../lib/ui";
 
 function unwrap<T>(res: { data?: T } | T): T {
   const d = res as { data?: T };
@@ -38,9 +29,8 @@ export default function TestResults() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
-
-  const [statusFilter, setStatusFilter] = useState<string>("all");
-  const [categoryFilter, setCategoryFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("all");
   const [endpointSearch, setEndpointSearch] = useState("");
 
   const fetchResults = useCallback(async () => {
@@ -54,8 +44,8 @@ export default function TestResults() {
       });
       const data = unwrap(res.data);
       setResults(Array.isArray(data) ? data : []);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load results");
+    } catch (err) {
+      setError(extractErrorMessage(err, "Failed to load results."));
       setResults([]);
     } finally {
       setLoading(false);
@@ -63,171 +53,159 @@ export default function TestResults() {
   }, [statusFilter, categoryFilter, endpointSearch]);
 
   useEffect(() => {
-    fetchResults();
+    void fetchResults();
   }, [fetchResults]);
 
-  const toggleExpand = (id: string) => {
-    setExpandedId((prev) => (prev === id ? null : id));
-  };
-
   return (
-    <div className="min-h-screen bg-slate-950 text-zinc-100 p-6">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <h1 className="text-2xl font-semibold text-zinc-50">Test Results</h1>
+    <div className="space-y-6">
+      <PageHeader
+        title="Test Results"
+        description="Filter functional execution history and inspect expected-vs-actual response details."
+        action={
+          <Button
+            variant="ghost"
+            icon={RefreshCw}
+            onClick={() => void fetchResults()}
+            loading={loading}
+          >
+            Refresh
+          </Button>
+        }
+      />
 
-        {/* Filter bar */}
-        <section className="flex flex-wrap items-center gap-4 rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-zinc-400">Status</label>
-            <select
+      <Panel title="Filters" eyebrow="Result search">
+        <div className="grid gap-4 md:grid-cols-[180px_180px_1fr]">
+          <Field label="Status">
+            <Select
               value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-              className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              onChange={(event) => setStatusFilter(event.target.value)}
             >
               <option value="all">All</option>
               <option value="passed">Passed</option>
               <option value="failed">Failed</option>
               <option value="error">Error</option>
-            </select>
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-zinc-400">Category</label>
-            <select
+            </Select>
+          </Field>
+          <Field label="Category">
+            <Select
               value={categoryFilter}
-              onChange={(e) => setCategoryFilter(e.target.value)}
-              className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              onChange={(event) => setCategoryFilter(event.target.value)}
             >
               <option value="all">All</option>
               <option value="individual">Individual</option>
               <option value="suite">Suite</option>
-            </select>
-          </div>
-          <div className="flex flex-1 min-w-[200px] items-center gap-2">
-            <label className="text-sm text-zinc-400">Endpoint</label>
-            <input
-              type="text"
-              value={endpointSearch}
-              onChange={(e) => setEndpointSearch(e.target.value)}
-              placeholder="Search endpoint..."
-              className="flex-1 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-            />
-          </div>
-        </section>
-
-        {error && (
-          <div className="rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-red-300">
-            {error}
-          </div>
-        )}
-
-        {/* Results table */}
-        <section className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/80">
-          {loading ? (
-            <div className="flex items-center justify-center py-16">
-              <span className="animate-pulse text-zinc-400">Loading results…</span>
+            </Select>
+          </Field>
+          <Field label="Endpoint">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-slate-500" />
+              <Input
+                value={endpointSearch}
+                onChange={(event) => setEndpointSearch(event.target.value)}
+                placeholder="Search endpoint..."
+                className="pl-9"
+              />
             </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-zinc-800">
-                    <th className="px-5 py-3 text-left font-medium text-zinc-400">
-                      Test Name
-                    </th>
-                    <th className="px-5 py-3 text-left font-medium text-zinc-400">
-                      Endpoint
-                    </th>
-                    <th className="px-5 py-3 text-left font-medium text-zinc-400">
-                      Method
-                    </th>
-                    <th className="px-5 py-3 text-left font-medium text-zinc-400">
-                      Status
-                    </th>
-                    <th className="px-5 py-3 text-right font-medium text-zinc-400">
-                      Expected
-                    </th>
-                    <th className="px-5 py-3 text-right font-medium text-zinc-400">
-                      Actual
-                    </th>
-                    <th className="px-5 py-3 text-right font-medium text-zinc-400">
-                      Response Time (ms)
-                    </th>
-                    <th className="px-5 py-3 text-right font-medium text-zinc-400">
-                      Assertions
-                    </th>
+          </Field>
+        </div>
+      </Panel>
+
+      {error && (
+        <InlineAlert tone="danger" title="Results failed">
+          {error}
+        </InlineAlert>
+      )}
+
+      <Panel title="Execution Results" eyebrow={`${results.length} rows`}>
+        {loading ? (
+          <EmptyState title="Loading results…" />
+        ) : results.length === 0 ? (
+          <EmptyState
+            title="No results found"
+            description="Adjust filters or execute tests from the dashboard or suites page."
+          />
+        ) : (
+          <DataTable>
+            <thead className={tableHeaderClass}>
+              <tr>
+                <th className={tableCellClass}>Test</th>
+                <th className={tableCellClass}>Endpoint</th>
+                <th className={tableCellClass}>Method</th>
+                <th className={tableCellClass}>Status</th>
+                <th className={`${tableCellClass} text-right`}>Expected</th>
+                <th className={`${tableCellClass} text-right`}>Actual</th>
+                <th className={`${tableCellClass} text-right`}>Time</th>
+                <th className={`${tableCellClass} text-right`}>Assertions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((row) => (
+                <Fragment key={row.id}>
+                  <tr
+                    onClick={() =>
+                      setExpandedId((current) => (current === row.id ? null : row.id))
+                    }
+                    className="cursor-pointer border-b border-slate-800/70 transition-colors hover:bg-slate-800/45"
+                  >
+                    <td className={`${tableCellClass} max-w-[240px]`}>
+                      <p className="truncate font-medium text-slate-100">
+                        {row.test_case_name}
+                      </p>
+                      <p className="mt-1 text-xs text-slate-500">{row.category}</p>
+                    </td>
+                    <td className={`${tableCellClass} max-w-[280px]`}>
+                      <p className="truncate font-mono text-xs text-slate-400">
+                        {row.endpoint}
+                      </p>
+                    </td>
+                    <td className={tableCellClass}>
+                      <MethodBadge method={row.method} />
+                    </td>
+                    <td className={tableCellClass}>
+                      <StatusBadge status={toStatus(row.status)} />
+                    </td>
+                    <td className={`${tableCellClass} text-right tabular-nums text-slate-300`}>
+                      {row.expected_status}
+                    </td>
+                    <td className={`${tableCellClass} text-right tabular-nums text-slate-300`}>
+                      {row.actual_status ?? "—"}
+                    </td>
+                    <td className={`${tableCellClass} text-right tabular-nums text-slate-300`}>
+                      {row.response_time_ms} ms
+                    </td>
+                    <td className={`${tableCellClass} text-right tabular-nums text-slate-300`}>
+                      {row.assertions_passed}/{row.assertions_total}
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {results.length === 0 ? (
+                  {expandedId === row.id && (
                     <tr>
-                      <td
-                        colSpan={8}
-                        className="px-5 py-8 text-center text-zinc-500"
-                      >
-                        No results found
+                      <td colSpan={8} className="border-b border-slate-800 bg-slate-950/70 p-4">
+                        <ResponseDiff
+                          expectedBody={row.expected_body}
+                          actualBody={row.actual_body}
+                          expectedStatus={row.expected_status}
+                          actualStatus={row.actual_status}
+                        />
                       </td>
                     </tr>
-                  ) : (
-                    results.map((row, i) => (
-                      <Fragment key={row.id}>
-                        <tr
-                          key={row.id}
-                          onClick={() => toggleExpand(row.id)}
-                          className={`cursor-pointer transition-colors hover:bg-zinc-800/50 ${
-                            i % 2 === 0 ? "bg-zinc-900/50" : "bg-zinc-800/30"
-                          }`}
-                        >
-                          <td className="px-5 py-3 font-medium text-zinc-100">
-                            {row.test_case_name}
-                          </td>
-                          <td className="max-w-[200px] truncate px-5 py-3 font-mono text-zinc-400">
-                            {row.endpoint}
-                          </td>
-                          <td className="px-5 py-3">
-                            <MethodBadge method={row.method} />
-                          </td>
-                          <td className="px-5 py-3">
-                            <StatusBadge
-                              status={(row.status as TestStatus) || "pending"}
-                            />
-                          </td>
-                          <td className="px-5 py-3 text-right tabular-nums text-zinc-300">
-                            {row.expected_status}
-                          </td>
-                          <td className="px-5 py-3 text-right tabular-nums text-zinc-300">
-                            {row.actual_status ?? "—"}
-                          </td>
-                          <td className="px-5 py-3 text-right tabular-nums text-zinc-300">
-                            {row.response_time_ms}
-                          </td>
-                          <td className="px-5 py-3 text-right tabular-nums text-zinc-300">
-                            {row.assertions_passed}/{row.assertions_total}
-                          </td>
-                        </tr>
-                        {expandedId === row.id && (
-                          <tr key={`${row.id}-expanded`}>
-                            <td
-                              colSpan={8}
-                              className="border-t border-zinc-800 bg-zinc-950/80 px-5 py-4"
-                            >
-                              <ResponseDiff
-                                expectedBody={row.expected_body}
-                                actualBody={row.actual_body}
-                                expectedStatus={row.expected_status}
-                                actualStatus={row.actual_status}
-                              />
-                            </td>
-                          </tr>
-                        )}
-                      </Fragment>
-                    ))
                   )}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      </div>
+                </Fragment>
+              ))}
+            </tbody>
+          </DataTable>
+        )}
+      </Panel>
+
+      <Panel title="Inspection Notes">
+        <div className="flex items-start gap-3 text-sm text-slate-400">
+          <Activity className="mt-0.5 size-4 shrink-0 text-emerald-300" />
+          <p>
+            Click any result row to compare status code and response body. Long
+            endpoints stay available in the expanded detail rather than crowding the
+            table.
+          </p>
+        </div>
+      </Panel>
     </div>
   );
 }

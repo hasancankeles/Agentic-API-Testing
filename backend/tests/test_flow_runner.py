@@ -48,6 +48,40 @@ class FlowRunnerTests(TestCase):
         self.assertEqual(rendered["headers"]["Authorization"], "Bearer abc")
         self.assertEqual(rendered["path"], "/users/42")
 
+    def test_run_context_exposes_sanitized_unique_id(self) -> None:
+        flow = FlowScenario(
+            id="flow_unique",
+            name="Unique signup flow",
+            steps=[
+                FlowStep(
+                    step_id="register",
+                    order=1,
+                    name="Register",
+                    method=HttpMethod.POST,
+                    endpoint="/register",
+                    body={
+                        "email": "user_{{ctx.unique_id}}@example.com",
+                        "password": "Passw0rd!{{ctx.unique_id}}",
+                    },
+                    expected_status=201,
+                )
+            ],
+        )
+        captured_json = {}
+
+        def fake_request(**kwargs):
+            captured_json.update(kwargs.get("json") or {})
+            return _FakeResponse(201, {"ok": True}, {})
+
+        with patch("flows.runner.http_requests.request", side_effect=fake_request):
+            result = run_flow_scenario(flow, "http://api.example.com")
+
+        self.assertEqual(result.status.value, "passed")
+        self.assertIn("unique_id", result.final_context)
+        self.assertNotIn("-", result.final_context["unique_id"])
+        self.assertEqual(captured_json["email"], f"user_{result.final_context['unique_id']}@example.com")
+        self.assertEqual(captured_json["password"], f"Passw0rd!{result.final_context['unique_id']}")
+
     def test_extraction_from_body_headers_and_status(self) -> None:
         flow = FlowScenario(
             id="flow_1",

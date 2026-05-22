@@ -242,6 +242,8 @@ class InjectLoginPrependTests(TestCase):
         # so they target the same just-registered user.
         self.assertEqual(steps[0].body.get("email"), steps[1].body.get("email"))
         self.assertEqual(steps[0].body.get("password"), steps[1].body.get("password"))
+        self.assertIn("{{ctx.unique_id}}", steps[0].body.get("email"))
+        self.assertIn("{{ctx.unique_id}}", steps[0].body.get("password"))
 
     def test_login_only_prepended_when_app_context_credentials_provided(self) -> None:
         parsed_api = _parse(SPEC_WITH_LOGIN_AND_REGISTER)
@@ -393,16 +395,66 @@ paths:
         self.assertEqual(steps[2].endpoint, "/cart/items")
         self.assertEqual(steps[2].order, 3)
 
-        # Register body must reuse the LLM's login credentials so the user it
-        # creates is exactly the one login then tries to authenticate.
-        self.assertEqual(steps[0].body.get("email"), invented_body["email"])
-        self.assertEqual(steps[0].body.get("password"), invented_body["password"])
+        # Generated register+login credentials must be run-scoped, not the
+        # static credentials invented by the LLM. Otherwise repeat runs can
+        # collide with an already existing user.
+        self.assertEqual(steps[0].body.get("email"), "user_{{ctx.unique_id}}@example.com")
+        self.assertEqual(steps[0].body.get("password"), "Passw0rd!{{ctx.unique_id}}")
+        self.assertEqual(steps[1].body.get("email"), steps[0].body.get("email"))
+        self.assertEqual(steps[1].body.get("password"), steps[0].body.get("password"))
+        self.assertNotEqual(steps[1].body.get("email"), invented_body["email"])
 
         # The prepended register must be soft so a 409 "Email already
         # registered" on a repeat run does not block the subsequent login.
         self.assertFalse(steps[0].required)
         self.assertEqual(steps[0].assertions, [])
         self.assertIsNone(steps[0].expected_status)
+
+    def test_register_prepended_reuses_app_context_credentials_when_login_present(self) -> None:
+        parsed_api = _parse(SPEC_WITH_LOGIN_AND_REGISTER)
+        flow = _make_flow(
+            [
+                _step(
+                    step_id="llm_login",
+                    order=1,
+                    endpoint="/auth/login",
+                    method=HttpMethod.POST,
+                    body={"email": "llm-static@example.com", "password": "Password123!"},
+                    extract=[
+                        FlowExtractRule(var="auth_token", source="body", path="access_token"),
+                    ],
+                ),
+                _step(
+                    step_id="add_item",
+                    order=2,
+                    endpoint="/cart/items",
+                    method=HttpMethod.POST,
+                    headers={"Authorization": "Bearer {{ctx.auth_token}}"},
+                ),
+            ]
+        )
+        req = FlowGenerateRequest(
+            max_flows=5,
+            max_steps_per_flow=10,
+            app_context={
+                "auth": {
+                    "test_user": {
+                        "email": "known@example.com",
+                        "password": "KnownPassw0rd!",
+                    }
+                }
+            },
+        )
+
+        flows, injected, skip_reasons = _inject_login_prepend([flow], parsed_api, req)
+
+        self.assertEqual(injected, 1)
+        self.assertEqual(skip_reasons, {})
+        steps = flows[0].steps
+        self.assertEqual(steps[0].body.get("email"), "known@example.com")
+        self.assertEqual(steps[1].body.get("email"), "known@example.com")
+        self.assertEqual(steps[0].body.get("password"), "KnownPassw0rd!")
+        self.assertEqual(steps[1].body.get("password"), "KnownPassw0rd!")
 
     def test_no_changes_when_login_and_register_both_present(self) -> None:
         parsed_api = _parse(SPEC_WITH_LOGIN_AND_REGISTER)

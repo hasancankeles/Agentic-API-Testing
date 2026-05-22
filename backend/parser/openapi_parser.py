@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from urllib.parse import urljoin, urlparse
+from typing import Any
 
 import yaml
 import requests as http_requests
@@ -22,10 +23,12 @@ def load_spec(source: str) -> dict:
         resp = http_requests.get(source, timeout=15)
         resp.raise_for_status()
         return yaml.safe_load(resp.text)
+    if "\n" in source or "\r" in source:
+        return yaml.safe_load(source)
     try:
         with open(source, "r") as f:
             return yaml.safe_load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return yaml.safe_load(source)
 
 
@@ -34,15 +37,98 @@ def _resolve_schema_ref(schema: dict, all_schemas: dict[str, dict], max_depth: i
     depth = 0
     while depth < max_depth and isinstance(current, dict) and "$ref" in current:
         ref = str(current.get("$ref") or "")
-        if not ref.startswith("#/components/schemas/"):
+        if ref.startswith("#/components/schemas/"):
+            schema_name = ref.rsplit("/", 1)[-1]
+        elif ref.startswith("#/definitions/"):
+            schema_name = ref.rsplit("/", 1)[-1]
+        else:
             break
-        schema_name = ref.rsplit("/", 1)[-1]
         resolved = all_schemas.get(schema_name)
         if not isinstance(resolved, dict):
             break
         current = resolved
         depth += 1
     return current if isinstance(current, dict) else {}
+
+
+def _sample_value_from_schema(
+    schema: dict,
+    all_schemas: dict[str, dict],
+    field_name: str = "value",
+    max_depth: int = 4,
+) -> Any:
+    resolved = _resolve_schema_ref(schema, all_schemas)
+    if not isinstance(resolved, dict) or max_depth <= 0:
+        return "sample"
+
+    if "example" in resolved:
+        return resolved["example"]
+    if "default" in resolved:
+        return resolved["default"]
+
+    lowered = field_name.lower()
+    schema_type = str(resolved.get("type") or "").lower()
+    if not schema_type and "properties" in resolved:
+        schema_type = "object"
+    if not schema_type and "items" in resolved:
+        schema_type = "array"
+
+    if schema_type == "object":
+        properties = resolved.get("properties", {})
+        if isinstance(properties, dict) and properties:
+            return {
+                str(name): _sample_value_from_schema(
+                    prop if isinstance(prop, dict) else {},
+                    all_schemas,
+                    str(name),
+                    max_depth - 1,
+                )
+                for name, prop in properties.items()
+            }
+        return {}
+
+    if schema_type == "array":
+        items = resolved.get("items", {})
+        return [
+            _sample_value_from_schema(
+                items if isinstance(items, dict) else {},
+                all_schemas,
+                field_name,
+                max_depth - 1,
+            )
+        ]
+
+    if schema_type in {"integer", "number"}:
+        if "price" in lowered:
+            return 111
+        if lowered.endswith("id") or lowered == "id":
+            return 1
+        return 1
+
+    if schema_type == "boolean":
+        return True
+
+    if "username" in lowered:
+        return "admin"
+    if "password" in lowered:
+        return "password123"
+    if "firstname" in lowered or lowered in {"first_name", "name"}:
+        return "Jim"
+    if "lastname" in lowered or lowered == "last_name":
+        return "Brown"
+    if "checkin" in lowered:
+        return "2026-01-01"
+    if "checkout" in lowered:
+        return "2026-01-02"
+    if "date" in lowered:
+        return "2026-01-01"
+    if "token" in lowered:
+        return "sample-token"
+    if "email" in lowered:
+        return "demo@example.com"
+    if "needs" in lowered:
+        return "Breakfast"
+    return "sample"
 
 
 def _extract_media_from_content(content: dict) -> tuple[str, dict]:
@@ -89,7 +175,34 @@ def _extract_request_body_hints(
         required_fields = []
 
     example, _examples_map = _extract_media_examples(media)
+    if example is None and schema:
+        example = _sample_value_from_schema(media.get("schema", {}), all_schemas)
     return [str(field) for field in required_fields], example
+
+
+def _swagger_body_request_body(op_data: dict, all_schemas: dict[str, dict]) -> dict | None:
+    params = op_data.get("parameters", [])
+    if not isinstance(params, list):
+        return None
+
+    for param in params:
+        if not isinstance(param, dict) or param.get("in") != "body":
+            continue
+        schema = param.get("schema", {})
+        if not isinstance(schema, dict):
+            schema = {}
+        example = param.get("example")
+        if example is None:
+            example = _sample_value_from_schema(schema, all_schemas)
+        return {
+            "content": {
+                "application/json": {
+                    "schema": schema,
+                    "example": example,
+                }
+            }
+        }
+    return None
 
 
 def _merge_parameters(path_level: list[ParsedParameter], operation_level: list[ParsedParameter]) -> list[ParsedParameter]:
@@ -145,14 +258,23 @@ def _extract_parameters(params_raw: list[dict]) -> list[ParsedParameter]:
     return result
 
 
-def _extract_responses(responses_raw: dict) -> list[ParsedResponse]:
+def _extract_responses(responses_raw: dict, all_schemas: dict[str, dict] | None = None) -> list[ParsedResponse]:
     result: list[ParsedResponse] = []
+    schema_index = all_schemas or {}
     for status_code, resp_data in responses_raw.items():
         content = resp_data.get("content", {})
         content_type, media = _extract_media_from_content(content)
         schema = media.get("schema", {})
+        if not schema and isinstance(resp_data.get("schema"), dict):
+            schema = resp_data.get("schema", {})
         schema_ref = schema.get("$ref", None)
+        if schema_ref is None and isinstance(schema.get("items"), dict):
+            schema_ref = schema["items"].get("$ref")
         example, examples = _extract_media_examples(media)
+        if example is None and isinstance(resp_data.get("example"), (dict, list, str, int, float, bool)):
+            example = resp_data.get("example")
+        if example is None and schema:
+            example = _sample_value_from_schema(schema, schema_index)
         links = resp_data.get("links", {}) if isinstance(resp_data, dict) else {}
         result.append(
             ParsedResponse(
@@ -265,7 +387,10 @@ def parse_openapi(source: str) -> ParsedAPI:
     servers = spec.get("servers", [])
     base_url = _resolve_base_url(source, servers if isinstance(servers, list) else [])
     global_security = spec.get("security")
-    all_schemas = spec.get("components", {}).get("schemas", {}) or {}
+    all_schemas = {
+        **(spec.get("components", {}).get("schemas", {}) or {}),
+        **(spec.get("definitions", {}) or {}),
+    }
 
     endpoints: list[ParsedEndpoint] = []
     for path, path_data in spec.get("paths", {}).items():
@@ -276,9 +401,9 @@ def parse_openapi(source: str) -> ParsedAPI:
 
             op_parameters = _extract_parameters(op_data.get("parameters", []))
             merged_parameters = _merge_parameters(path_level_parameters, op_parameters)
-            responses = _extract_responses(op_data.get("responses", {}))
+            responses = _extract_responses(op_data.get("responses", {}), all_schemas)
             security, requires_auth = _detect_requires_auth(op_data.get("security"), global_security, merged_parameters)
-            request_body = op_data.get("requestBody")
+            request_body = op_data.get("requestBody") or _swagger_body_request_body(op_data, all_schemas)
             required_fields, request_body_example = _extract_request_body_hints(request_body, all_schemas)
             response_examples = {
                 response.status_code: response.example

@@ -14,7 +14,11 @@ from flows.generator import (  # noqa: E402
     _flow_quality_errors,
     _infer_objectives,
     _llm_compose_flows,
+    _llm_critic_repair,
     _llm_generate_candidate_flows,
+    _llm_plan_scenarios,
+    _llm_review_candidates,
+    _normalize_llm_flow_payload,
     _inject_negative_step,
     _review_candidate_flows,
     generate_flows,
@@ -77,12 +81,13 @@ paths:
         ):
             flows, summary = await generate_flows(parsed_api, req, "gen-1")
 
-        self.assertEqual(len(flows), 1)
+        self.assertGreaterEqual(len(flows), 1)
         self.assertEqual(flows[0].name, "LLM Flow")
         self.assertEqual(summary["source"], "llm_refined")
         self.assertFalse(summary["fallback_used"])
         self.assertTrue(summary["llm_attempted"])
         self.assertEqual(summary["llm_normalizations_applied"], 3)
+        self.assertEqual(summary["llm_deterministic_backfill_count"], len(flows) - 1)
         self.assertTrue(summary["reviewer_applied"])
 
     async def test_generate_flows_falls_back_when_llm_invalid(self) -> None:
@@ -284,6 +289,67 @@ paths:
         errors = _flow_quality_errors(flow, FlowGenerateRequest())
         self.assertTrue(any("read-after-write verification" in error for error in errors))
 
+    def test_quality_gate_requires_read_after_final_write_not_before(self) -> None:
+        flow = FlowScenario(
+            id="quality_read_order",
+            name="Read before write",
+            steps=[
+                FlowStep(
+                    step_id="list",
+                    order=1,
+                    name="List items",
+                    method=HttpMethod.GET,
+                    endpoint="/items",
+                    expected_status=200,
+                ),
+                FlowStep(
+                    step_id="create",
+                    order=2,
+                    name="Create item",
+                    method=HttpMethod.POST,
+                    endpoint="/items",
+                    body={"name": "x"},
+                    expected_status=201,
+                ),
+            ],
+        )
+
+        errors = _flow_quality_errors(flow, FlowGenerateRequest())
+
+        self.assertTrue(any("read-after-write verification" in error for error in errors))
+
+    def test_quality_gate_treats_authorized_business_write_as_mutation(self) -> None:
+        flow = FlowScenario(
+            id="quality_authorized_write",
+            name="Authorized write without verification",
+            steps=[
+                FlowStep(
+                    step_id="auth",
+                    order=1,
+                    name="Authenticate",
+                    method=HttpMethod.POST,
+                    endpoint="/auth",
+                    extract=[{"var": "auth_token", "from": "body", "path": "token", "required": True}],
+                    expected_status=200,
+                ),
+                FlowStep(
+                    step_id="update",
+                    order=2,
+                    name="Update booking",
+                    method=HttpMethod.PATCH,
+                    endpoint="/booking/{id}",
+                    path_params={"id": "{{ctx.booking_id}}"},
+                    headers={"Authorization": "Bearer {{ctx.auth_token}}"},
+                    body={"firstname": "Updated"},
+                    expected_status=200,
+                ),
+            ],
+        )
+
+        errors = _flow_quality_errors(flow, FlowGenerateRequest())
+
+        self.assertTrue(any("read-after-write verification" in error for error in errors))
+
     def test_quality_gate_safe_policy_ignores_auth_step_as_business_mutation(self) -> None:
         flow = FlowScenario(
             id="quality_3",
@@ -377,6 +443,202 @@ paths:
         )
         self.assertTrue(has_login or has_auth_header)
 
+    async def test_swagger_booker_style_flows_use_runnable_auth_and_id_hints(self) -> None:
+        parsed_api = parse_openapi(
+            """
+swagger: "2.0"
+info:
+  title: Booker
+  version: "1.0"
+paths:
+  /auth:
+    post:
+      summary: Get an authorization token
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/AuthParams"
+      responses:
+        "200":
+          description: ok
+          schema:
+            $ref: "#/definitions/AuthResponse"
+  /booking:
+    get:
+      summary: Get booking IDs
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/GetIdsResponse"
+  /booking/{id}:
+    put:
+      summary: Update a booking
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Authorization
+          in: header
+          required: true
+          schema: { type: string }
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/Booking"
+      responses:
+        "200":
+          description: ok
+definitions:
+  AuthParams:
+    type: object
+    properties:
+      username: { type: string }
+      password: { type: string }
+  AuthResponse:
+    type: object
+    properties:
+      token: { type: string }
+  GetIdsResponse:
+    type: object
+    properties:
+      bookingid: { type: integer }
+  Booking:
+    type: object
+    properties:
+      firstname: { type: string }
+      lastname: { type: string }
+      totalprice: { type: integer }
+      depositpaid: { type: boolean }
+      bookingdates:
+        type: object
+        properties:
+          checkin: { type: string }
+          checkout: { type: string }
+      additionalneeds: { type: string }
+"""
+        )
+        req = FlowGenerateRequest(
+            generation_mode=FlowGenerationMode.DETERMINISTIC_FIRST,
+            mutation_policy=FlowMutationPolicy.SAFE,
+            max_flows=2,
+            max_steps_per_flow=4,
+        )
+
+        flows, _summary = await generate_flows(parsed_api, req, "booker-gen")
+
+        all_steps = [step for flow in flows for step in flow.steps]
+        auth_step = next(step for step in all_steps if step.endpoint == "/auth")
+        list_step = next(step for step in all_steps if step.endpoint == "/booking")
+        protected_step = next(step for step in all_steps if step.endpoint == "/booking/{id}")
+
+        self.assertEqual(auth_step.body, {"username": "admin", "password": "password123"})
+        self.assertTrue(
+            any(rule.var == "booking_id" and rule.path == "0.bookingid" for rule in list_step.extract)
+        )
+        self.assertEqual(protected_step.headers.get("Cookie"), "token={{ctx.auth_token}}")
+        self.assertEqual(protected_step.path_params.get("id"), "{{ctx.booking_id}}")
+        for flow in flows:
+            update_steps = [step for step in flow.steps if step.method == HttpMethod.PUT]
+            if not update_steps:
+                continue
+            last_update_order = max(step.order for step in update_steps)
+            self.assertTrue(
+                any(step.method == HttpMethod.GET and step.order > last_update_order for step in flow.steps)
+            )
+
+    def test_llm_normalization_adds_dual_auth_headers_for_protected_steps(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Auth API
+  version: "1.0"
+paths:
+  /booking/{id}:
+    put:
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Authorization
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+"""
+        )
+        raw_flow = {
+            "name": "LLM booking update",
+            "steps": [
+                {
+                    "step_id": "update",
+                    "order": 1,
+                    "name": "Update",
+                    "method": "PUT",
+                    "endpoint": "/booking/{id}",
+                    "path_params": {"id": "{{ctx.booking_id}}"},
+                    "headers": {"Cookie": "token={{ctx.auth_token}}"},
+                    "expected_status": 200,
+                    "extract": [],
+                }
+            ],
+        }
+
+        normalized, normalizations = _normalize_llm_flow_payload(raw_flow, parsed_api)
+
+        headers = normalized["steps"][0]["headers"]
+        self.assertGreaterEqual(normalizations, 1)
+        self.assertEqual(headers.get("Authorization"), "Bearer {{ctx.auth_token}}")
+        self.assertEqual(headers.get("Cookie"), "token={{ctx.auth_token}}")
+
+    def test_llm_normalization_reconciles_success_status_with_openapi(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Status API
+  version: "1.0"
+paths:
+  /ping:
+    get:
+      responses:
+        "201":
+          description: created
+"""
+        )
+        raw_flow = {
+            "name": "LLM status flow",
+            "steps": [
+                {
+                    "step_id": "ping",
+                    "order": 1,
+                    "name": "Ping",
+                    "method": "GET",
+                    "endpoint": "/ping",
+                    "expected_status": 200,
+                    "assertions": [{"field": "status_code", "operator": "eq", "expected": 200}],
+                    "extract": [],
+                }
+            ],
+        }
+
+        normalized, normalizations = _normalize_llm_flow_payload(raw_flow, parsed_api)
+
+        step = normalized["steps"][0]
+        self.assertGreaterEqual(normalizations, 1)
+        self.assertEqual(step["expected_status"], 201)
+        self.assertEqual(step["assertions"][0]["expected"], 201)
+
     async def test_llm_compose_normalizes_legacy_extract_schema(self) -> None:
         parsed_api = parse_openapi(
             """
@@ -444,6 +706,110 @@ paths:
         self.assertEqual(extract.source.value, "body")
         self.assertEqual(extract.path, "status")
         self.assertFalse(extract.required)
+
+    async def test_llm_first_prompts_request_multiple_distinct_flows(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Multi Flow Prompt API
+  version: "1.0"
+paths:
+  /items:
+    get:
+      responses:
+        "200":
+          description: ok
+  /items/{id}:
+    get:
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+"""
+        )
+        req = FlowGenerateRequest(max_flows=3, max_steps_per_flow=5)
+        captured: dict[str, str] = {}
+
+        async def fake_json_call(_client, _model, prompt: str, label: str):
+            captured[label] = prompt
+            if label == "scenario planner":
+                return {
+                    "scenarios": [
+                        {
+                            "name": "Browse",
+                            "description": "browse items",
+                            "persona": "tester",
+                            "tags": ["browse"],
+                            "objective": "browse",
+                            "ordered_operations": [{"operation": "GET /items", "reason": "list"}],
+                        }
+                    ]
+                }
+            return {
+                "flows": [
+                    {
+                        "name": "Browse flow",
+                        "description": "browse items",
+                        "persona": "tester",
+                        "preconditions": [],
+                        "tags": ["browse"],
+                        "steps": [
+                            {
+                                "step_id": "list_items",
+                                "order": 1,
+                                "name": "List items",
+                                "method": "GET",
+                                "endpoint": "/items",
+                                "assertions": [{"field": "status_code", "operator": "eq", "expected": 200}],
+                                "expected_status": 200,
+                                "required": True,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        with patch("flows.generator._llm_json_call", side_effect=fake_json_call):
+            scenarios = await _llm_plan_scenarios(
+                client=object(),
+                parsed_api=parsed_api,
+                req=req,
+                objectives=["browse", "detail", "create"],
+                dependency_hints=[],
+            )
+            flows, _normalizations = await _llm_compose_flows(
+                client=object(),
+                parsed_api=parsed_api,
+                req=req,
+                objectives=["browse", "detail", "create"],
+                seed_flows=[],
+                scenarios=scenarios,
+                dependency_hints=[],
+            )
+            await _llm_critic_repair(
+                client=object(),
+                parsed_api=parsed_api,
+                req=req,
+                flows=flows,
+            )
+
+        self.assertIn("target_scenario_count=3", captured["scenario planner"])
+        self.assertIn("Return exactly max_flows scenarios", captured["scenario planner"])
+        self.assertIn("Do not plan one-step flows", captured["scenario planner"])
+        self.assertIn("include an earlier producer operation", captured["scenario planner"])
+        self.assertIn("target_flow_count=3", captured["flow composer"])
+        self.assertIn("aim for exactly max_flows", captured["flow composer"])
+        self.assertIn("Never return a one-step flow", captured["flow composer"])
+        self.assertIn("an earlier step in the same flow must extract that exact ctx variable", captured["flow composer"])
+        self.assertIn("Preserve as many distinct valid flows as possible", captured["flow critic"])
+        self.assertIn("Repair one-step flows", captured["flow critic"])
+        self.assertIn("Repair missing id dependencies", captured["flow critic"])
+        self.assertIn("max_flows=3", captured["flow critic"])
 
     async def test_pure_llm_prompt_omits_seed_flow_scaffolding(self) -> None:
         parsed_api = parse_openapi(
@@ -527,7 +893,12 @@ paths:
             )
 
         self.assertEqual(len(flows), 1)
-        self.assertIn("candidate_limit=4", captured["prompt"])
+        self.assertIn("candidate_limit=6", captured["prompt"])
+        self.assertIn("accepted_flow_target=2", captured["prompt"])
+        self.assertIn("Return exactly candidate_limit candidate flows", captured["prompt"])
+        self.assertIn("Do not stop after one valid flow", captured["prompt"])
+        self.assertIn("Never return a one-step flow", captured["prompt"])
+        self.assertIn("an earlier step must extract that exact variable", captured["prompt"])
         self.assertNotIn("Deterministic seed flows", captured["prompt"])
 
     async def test_pure_llm_collects_schema_invalid_candidates(self) -> None:
@@ -1017,6 +1388,62 @@ paths:
         self.assertEqual(len(accepted), 1)
         self.assertEqual(eliminated, [])
         self.assertTrue(reviewer_applied)
+
+    async def test_reviewer_prompt_allows_token_template_auth_variants(self) -> None:
+        parsed_api = parse_openapi(
+            """
+openapi: 3.0.0
+info:
+  title: Auth Review API
+  version: "1.0"
+paths:
+  /private:
+    get:
+      parameters:
+        - name: Authorization
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+"""
+        )
+        flow = FlowScenario(
+            name="Protected read",
+            steps=[
+                FlowStep(
+                    step_id="read",
+                    order=1,
+                    name="Read",
+                    method=HttpMethod.GET,
+                    endpoint="/private",
+                    headers={"Authorization": "Bearer {{ctx.auth_token}}"},
+                    expected_status=200,
+                )
+            ],
+        )
+        captured_prompt = ""
+
+        async def fake_llm_json_call(_client, _model, prompt, _label):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return {
+                "decisions": [
+                    {"candidate_id": "candidate_1", "keep": True, "reason_code": "accepted", "reason": ""}
+                ]
+            }
+
+        with patch("flows.generator._llm_json_call", new=fake_llm_json_call):
+            await _llm_review_candidates(
+                client=object(),
+                parsed_api=parsed_api,
+                req=FlowGenerateRequest(),
+                flows=[("candidate_1", flow)],
+            )
+
+        self.assertIn("Do not reject solely because an Authorization header uses a Bearer token template", captured_prompt)
+        self.assertIn("Authorization and/or Cookie", captured_prompt)
 
     def test_invalid_negative_injection_is_skipped_with_reason(self) -> None:
         parsed_api = parse_openapi(

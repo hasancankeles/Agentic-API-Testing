@@ -123,6 +123,40 @@ app.add_middleware(
 )
 
 
+def _normalize_target_base_url(value: str) -> str:
+    target = value.strip().rstrip("/")
+    parsed = urlsplit(target)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="Target base URL must be a full http(s) URL, for example https://restful-booker.herokuapp.com.",
+        )
+    return target
+
+
+async def _resolve_target_base_url(
+    requested_target_base_url: str | None,
+    db: AsyncSession,
+) -> str:
+    if requested_target_base_url and requested_target_base_url.strip():
+        return _normalize_target_base_url(requested_target_base_url)
+
+    latest_parsed_result = await db.execute(
+        select(DBParsedAPI).order_by(DBParsedAPI.parsed_at.desc()).limit(1)
+    )
+    latest_parsed = latest_parsed_result.scalar_one_or_none()
+    if latest_parsed and latest_parsed.base_url:
+        return _normalize_target_base_url(latest_parsed.base_url)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Target base URL is required because the latest parsed API spec does not declare one. "
+            "For the Booker demo, use https://restful-booker.herokuapp.com."
+        ),
+    )
+
+
 # ──────────────────────────────────────────────
 #  Parse
 # ──────────────────────────────────────────────
@@ -310,13 +344,7 @@ async def execute_tests(req: ExecuteRequest, db: AsyncSession = Depends(get_db))
     if not db_suites:
         raise HTTPException(status_code=404, detail="No test suites found")
 
-    target_base_url = req.target_base_url
-    if not target_base_url:
-        latest_parsed_result = await db.execute(
-            select(DBParsedAPI).order_by(DBParsedAPI.parsed_at.desc()).limit(1)
-        )
-        latest_parsed = latest_parsed_result.scalar_one_or_none()
-        target_base_url = latest_parsed.base_url if latest_parsed and latest_parsed.base_url else "http://localhost:8080"
+    target_base_url = await _resolve_target_base_url(req.target_base_url, db)
 
     run_id = str(uuid.uuid4())
     started_at = datetime.utcnow()
@@ -802,13 +830,7 @@ async def run_flows(req: FlowRunRequest, db: AsyncSession = Depends(get_db)):
     if not db_flows:
         raise HTTPException(status_code=404, detail="No flow scenarios found")
 
-    target_base_url = req.target_base_url
-    if not target_base_url:
-        latest_parsed_result = await db.execute(
-            select(DBParsedAPI).order_by(DBParsedAPI.parsed_at.desc()).limit(1)
-        )
-        latest_parsed = latest_parsed_result.scalar_one_or_none()
-        target_base_url = latest_parsed.base_url if latest_parsed and latest_parsed.base_url else "http://localhost:8080"
+    target_base_url = await _resolve_target_base_url(req.target_base_url, db)
 
     run_group_id = str(uuid.uuid4())
     run_records = []

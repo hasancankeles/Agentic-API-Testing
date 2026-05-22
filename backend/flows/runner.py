@@ -314,6 +314,7 @@ def run_flow_scenario(
 
     ctx: dict[str, Any] = {
         "run_id": flow_run_id,
+        "unique_id": flow_run_id.replace("-", ""),
         "timestamp": started_at.isoformat(),
     }
     if initial_context:

@@ -628,6 +628,113 @@ def _normalize_assertions(assertions: list[TestAssertion]) -> list[TestAssertion
     return normalized
 
 
+def _path_template_matches(template: str, path: str) -> bool:
+    normalized_template = template.split("?", 1)[0]
+    normalized_path = path.split("?", 1)[0]
+    if normalized_template == normalized_path:
+        return True
+
+    template_segments = [segment for segment in normalized_template.strip("/").split("/") if segment]
+    path_segments = [segment for segment in normalized_path.strip("/").split("/") if segment]
+    if len(template_segments) != len(path_segments):
+        return False
+
+    for template_segment, path_segment in zip(template_segments, path_segments):
+        is_placeholder = template_segment.startswith("{") and template_segment.endswith("}")
+        if is_placeholder:
+            if not path_segment:
+                return False
+            continue
+        if template_segment != path_segment:
+            return False
+
+    return True
+
+
+def _find_contract_endpoint(parsed_api: ParsedAPI, test_case: TestCase):
+    test_path = _normalize_endpoint_path(test_case.endpoint, parsed_api.base_url).split("?", 1)[0]
+    for endpoint in parsed_api.endpoints:
+        if endpoint.method != test_case.method:
+            continue
+        contract_path = _normalize_endpoint_path(endpoint.path, parsed_api.base_url).split("?", 1)[0]
+        if _path_template_matches(contract_path, test_path):
+            return endpoint
+    return None
+
+
+def _contract_response_statuses(endpoint) -> list[int]:
+    statuses: list[int] = []
+    for response in endpoint.responses:
+        try:
+            statuses.append(int(str(response.status_code)))
+        except (TypeError, ValueError):
+            continue
+    return statuses
+
+
+def _preferred_success_status(statuses: list[int], method: HttpMethod) -> int | None:
+    success_statuses = [status for status in statuses if 200 <= status <= 299]
+    if not success_statuses:
+        return None
+
+    if method == HttpMethod.POST:
+        preferred = [201, 200, 202, 204]
+    elif method == HttpMethod.DELETE:
+        preferred = [204, 200, 202, 201]
+    else:
+        preferred = [200, 201, 204, 202]
+
+    for status in preferred:
+        if status in success_statuses:
+            return status
+    return success_statuses[0]
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _reconcile_success_status_with_contract(test_case: TestCase, parsed_api: ParsedAPI) -> None:
+    if not (200 <= int(test_case.expected_status) <= 299):
+        return
+
+    endpoint = _find_contract_endpoint(parsed_api, test_case)
+    if endpoint is None:
+        return
+
+    statuses = _contract_response_statuses(endpoint)
+    if not statuses or test_case.expected_status in statuses:
+        return
+
+    expected_status = _preferred_success_status(statuses, test_case.method)
+    if expected_status is None or expected_status == test_case.expected_status:
+        return
+
+    previous_status = int(test_case.expected_status)
+    test_case.expected_status = expected_status
+
+    reconciled_assertions: list[TestAssertion] = []
+    for assertion in test_case.assertions:
+        if (
+            assertion.field == "status_code"
+            and assertion.operator == "eq"
+            and _int_or_none(assertion.expected) == previous_status
+        ):
+            reconciled_assertions.append(assertion.model_copy(update={"expected": expected_status}))
+        else:
+            reconciled_assertions.append(assertion)
+    test_case.assertions = reconciled_assertions
+
+
+def _reconcile_http_cases_with_contract(suites: list[TestSuite], parsed_api: ParsedAPI) -> None:
+    for suite in suites:
+        for test_case in suite.test_cases:
+            _reconcile_success_status_with_contract(test_case, parsed_api)
+
+
 async def _call_model_text(client: genai.Client, model_name: str, prompt: str, stage: str) -> str:
     try:
         response = await client.aio.models.generate_content(
@@ -1125,6 +1232,8 @@ async def materialize_tests(
                     category=TestCategory.SUITE,
                 )
             )
+
+    _reconcile_http_cases_with_contract(suites, parsed_api)
 
     if debug_capture is not None:
         debug_capture.set_materialized_outputs(suites, load_scenarios)

@@ -50,6 +50,22 @@ paths:
     return {"spec_content": spec}
 
 
+def _parse_payload_without_base_url() -> dict:
+    spec = """
+openapi: 3.0.0
+info:
+  title: Missing Server API
+  version: "1.0"
+paths:
+  /posts:
+    get:
+      responses:
+        "200":
+          description: ok
+"""
+    return {"spec_content": spec}
+
+
 def _sample_flow() -> FlowScenario:
     return FlowScenario(
         id=str(uuid.uuid4()),
@@ -222,3 +238,38 @@ class FlowRouteTests(TestCase):
             run_detail = run_detail_res.json()
             self.assertEqual(run_detail["id"], run_id)
             self.assertEqual(len(run_detail["step_results"]), 1)
+
+    def test_flow_run_requires_target_when_parsed_spec_has_no_base_url(self) -> None:
+        flow = _sample_flow()
+        flow_summary = {
+            "flows_generated": 1,
+            "source": "deterministic_fallback",
+            "fallback_used": True,
+            "fallback_reason": "test",
+            "dependency_hints_count": 0,
+            "openapi_link_hints_count": 0,
+            "llm_attempted": False,
+            "llm_normalizations_applied": 0,
+            "candidate_flows_reviewed": 0,
+            "eliminated_flows_count": 0,
+            "eliminated_flows": [],
+            "reviewer_applied": False,
+            "reviewer_mode": None,
+            "negative_flows_added": 0,
+            "negative_generation_skipped_reason": "disabled",
+            "batch_created_at": datetime.utcnow().isoformat(),
+        }
+
+        with TestClient(main.app) as client:
+            parse_res = client.post("/api/parse", json=_parse_payload_without_base_url())
+            self.assertEqual(parse_res.status_code, 200)
+
+            with patch("main.generate_flows", AsyncMock(return_value=([flow], flow_summary))):
+                generate_res = client.post("/api/flows/generate", json={"max_flows": 1})
+            self.assertEqual(generate_res.status_code, 200)
+            flow_id = generate_res.json()["flows"][0]["id"]
+
+            run_res = client.post("/api/flows/run", json={"flow_ids": [flow_id]})
+
+        self.assertEqual(run_res.status_code, 400)
+        self.assertIn("Target base URL is required", run_res.json()["detail"])

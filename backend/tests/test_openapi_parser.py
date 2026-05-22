@@ -86,3 +86,62 @@ paths:
 """
         parsed = parse_openapi(spec)
         self.assertEqual(parsed.base_url, "https://staging.example.com/api/v2")
+
+    def test_swagger_2_body_and_response_schema_hints_are_extracted(self) -> None:
+        spec = """
+swagger: "2.0"
+info:
+  title: Booker
+  version: "1.0"
+paths:
+  /auth:
+    post:
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/AuthParams"
+      responses:
+        "200":
+          description: ok
+          schema:
+            $ref: "#/definitions/AuthResponse"
+  /booking:
+    get:
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/GetIdsResponse"
+definitions:
+  AuthParams:
+    type: object
+    properties:
+      username:
+        type: string
+      password:
+        type: string
+  AuthResponse:
+    type: object
+    properties:
+      token:
+        type: string
+  GetIdsResponse:
+    type: object
+    properties:
+      bookingid:
+        type: integer
+"""
+        parsed = parse_openapi(spec)
+        auth = next(endpoint for endpoint in parsed.endpoints if endpoint.path == "/auth")
+        booking_list = next(endpoint for endpoint in parsed.endpoints if endpoint.path == "/booking")
+
+        self.assertEqual(
+            auth.request_body_example,
+            {"username": "admin", "password": "password123"},
+        )
+        self.assertEqual(auth.responses[0].example, {"token": "sample-token"})
+        self.assertEqual(booking_list.responses[0].example, [{"bookingid": 1}])

@@ -1,12 +1,24 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  CheckCircle2,
+  History,
+  Play,
+  RefreshCw,
+  Route,
+  Sparkles,
+  Wand2,
+  XCircle,
+} from "lucide-react";
+import {
   generateFlows,
   getFlow,
   getFlowRun,
   listFlowRuns,
   listFlows,
   runFlows,
+  type EliminatedFlowCandidate,
   type FlowGenerateRequest,
+  type FlowGenerationMode,
   type FlowGenerationSummary,
   type FlowListItem,
   type FlowMutationPolicy,
@@ -14,103 +26,43 @@ import {
   type FlowRunListItem,
   type FlowRunRecord,
   type FlowScenario,
-  type FlowGenerationMode,
+  type FlowStep,
 } from "../api/client";
-import StatusBadge, { type TestStatus } from "../components/StatusBadge";
+import {
+  Badge,
+  Button,
+  DataTable,
+  EmptyState,
+  Field,
+  InlineAlert,
+  Input,
+  JsonDisclosure,
+  MethodBadge,
+  MetricCard,
+  PageHeader,
+  Panel,
+  Select,
+  StatusBadge,
+  tableCellClass,
+  tableHeaderClass,
+  Textarea,
+} from "../components/ui";
+import {
+  clampInt,
+  cn,
+  extractErrorMessage,
+  formatDate,
+  parseJsonObject,
+  toStatus,
+  truncateMiddle,
+} from "../lib/ui";
 
 function unwrap<T>(res: { data?: T } | T): T {
   const d = res as { data?: T };
   return (d.data !== undefined ? d.data : res) as T;
 }
 
-function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "—";
-  return new Date(dateStr).toLocaleString();
-}
-
-function toPrettyJson(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function clampInt(
-  value: number,
-  min: number,
-  max: number,
-  fallback: number
-): number {
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(value)));
-}
-
-function parseJsonObject(
-  raw: string,
-  fieldName: string
-): { value: Record<string, unknown> | null; error: string | null } {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return { value: {}, error: null };
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(trimmed);
-    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
-      return {
-        value: null,
-        error: `${fieldName} must be a JSON object.`,
-      };
-    }
-    return { value: parsed as Record<string, unknown>, error: null };
-  } catch {
-    return {
-      value: null,
-      error: `${fieldName} is not valid JSON.`,
-    };
-  }
-}
-
-function extractErrorMessage(error: unknown, fallback: string): string {
-  if (typeof error === "object" && error !== null) {
-    const maybe = error as {
-      message?: unknown;
-      response?: {
-        data?: {
-          detail?: unknown;
-        };
-      };
-    };
-    const detail = maybe.response?.data?.detail;
-    if (typeof detail === "string" && detail.trim()) {
-      return detail;
-    }
-    if (detail !== undefined && detail !== null) {
-      return toPrettyJson(detail);
-    }
-    if (typeof maybe.message === "string" && maybe.message.trim()) {
-      return maybe.message;
-    }
-  }
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return fallback;
-}
-
-function toTestStatus(status: string): TestStatus {
-  if (
-    status === "passed" ||
-    status === "failed" ||
-    status === "error" ||
-    status === "pending" ||
-    status === "running"
-  ) {
-    return status;
-  }
-  return "pending";
-}
+type FlowTab = "generate" | "review" | "run" | "history";
 
 type SuggestionChip = {
   label: string;
@@ -124,116 +76,267 @@ type FallbackDiagnostics = {
 };
 
 function analyzeFallbackReason(reason: string): FallbackDiagnostics {
-  const detail = (reason || "").trim();
-  if (!detail) {
-    return {
-      category: "none",
-      detail: "",
-      suggestions: [],
-    };
-  }
+  const detail = reason.trim();
+  if (!detail) return { category: "none", detail: "", suggestions: [] };
 
   const lowered = detail.toLowerCase();
-  if (lowered.includes("missing_gemini_api_key") || lowered.includes("api key")) {
+  if (lowered.includes("api key") || lowered.includes("missing_gemini_api_key")) {
     return {
       category: "configuration",
       detail,
       suggestions: [
-        { label: "Switch to deterministic_first", action: "deterministic_first" },
-        { label: "Retry with hybrid_auto", action: "retry_hybrid" },
+        { label: "Use deterministic mode", action: "deterministic_first" },
+        { label: "Retry hybrid", action: "retry_hybrid" },
       ],
     };
   }
-
-  if (lowered.includes("validation error") || lowered.includes("pydantic") || lowered.includes("missing")) {
+  if (lowered.includes("validation") || lowered.includes("pydantic") || lowered.includes("missing")) {
     return {
-      category: "schema_mismatch",
+      category: "schema mismatch",
       detail,
       suggestions: [
-        { label: "Switch to deterministic_first", action: "deterministic_first" },
-        { label: "Use safe mutation policy", action: "safe_policy" },
-        { label: "Reduce max steps", action: "reduce_steps" },
+        { label: "Use deterministic mode", action: "deterministic_first" },
+        { label: "Safe mutation policy", action: "safe_policy" },
+        { label: "Reduce steps", action: "reduce_steps" },
       ],
     };
   }
-
   if (lowered.includes("quality")) {
     return {
-      category: "quality_gate",
+      category: "quality gate",
       detail,
       suggestions: [
-        { label: "Use safe mutation policy", action: "safe_policy" },
-        { label: "Reduce max steps", action: "reduce_steps" },
-        { label: "Disable negatives for retry", action: "disable_negative" },
+        { label: "Safe mutation policy", action: "safe_policy" },
+        { label: "Reduce steps", action: "reduce_steps" },
+        { label: "Disable negatives", action: "disable_negative" },
       ],
     };
   }
-
   if (lowered.includes("timeout") || lowered.includes("upstream") || lowered.includes("server error")) {
     return {
-      category: "upstream_unavailable",
+      category: "upstream",
       detail,
       suggestions: [
-        { label: "Retry with hybrid_auto", action: "retry_hybrid" },
-        { label: "Switch to deterministic_first", action: "deterministic_first" },
+        { label: "Retry hybrid", action: "retry_hybrid" },
+        { label: "Use deterministic mode", action: "deterministic_first" },
       ],
     };
   }
-
   return {
     category: "other",
     detail,
     suggestions: [
-      { label: "Use safe mutation policy", action: "safe_policy" },
-      { label: "Switch to deterministic_first", action: "deterministic_first" },
+      { label: "Safe mutation policy", action: "safe_policy" },
+      { label: "Use deterministic mode", action: "deterministic_first" },
     ],
   };
 }
 
-const methodStyles: Record<string, string> = {
-  GET: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  POST: "bg-blue-500/20 text-blue-400 border-blue-500/30",
-  PUT: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  DELETE: "bg-red-500/20 text-red-400 border-red-500/30",
-  PATCH: "bg-violet-500/20 text-violet-400 border-violet-500/30",
-};
+function groupEliminated(items: EliminatedFlowCandidate[] = []) {
+  return items.reduce<Record<string, EliminatedFlowCandidate[]>>((acc, item) => {
+    const key = item.reason_code || "other";
+    acc[key] = [...(acc[key] ?? []), item];
+    return acc;
+  }, {});
+}
 
-function MethodBadge({ method }: { method: string }) {
-  const normalized = method.toUpperCase();
-  const style =
-    methodStyles[normalized] ??
-    "bg-zinc-500/20 text-zinc-400 border-zinc-500/30";
+function StepTimeline({ steps }: { steps: FlowStep[] }) {
+  const sorted = steps.slice().sort((a, b) => a.order - b.order);
   return (
-    <span
-      className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-mono font-medium ${style}`}
-    >
-      {normalized}
-    </span>
+    <div className="space-y-3">
+      {sorted.map((step) => (
+        <article
+          key={step.step_id}
+          className="rounded-lg border border-slate-800 bg-slate-950/55 p-3"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="neutral" className="font-mono">
+              #{step.order}
+            </Badge>
+            <MethodBadge method={step.method} />
+            <span className="min-w-0 flex-1 text-sm font-medium text-slate-100">
+              {step.name}
+            </span>
+            <Badge tone={step.required ? "info" : "neutral"}>
+              {step.required ? "required" : "optional"}
+            </Badge>
+          </div>
+          <p className="mt-2 break-all font-mono text-xs text-slate-400">
+            {step.endpoint}
+          </p>
+          <div className="mt-3 grid gap-2 text-xs text-slate-400 sm:grid-cols-3">
+            <span>
+              Expected:{" "}
+              <span className="font-mono text-slate-200">
+                {step.expected_status ?? "any"}
+              </span>
+            </span>
+            <span>
+              Extracts:{" "}
+              <span className="text-slate-200">
+                {step.extract.length > 0
+                  ? step.extract.map((rule) => rule.var).join(", ")
+                  : "none"}
+              </span>
+            </span>
+            <span>
+              Assertions:{" "}
+              <span className="font-mono text-slate-200">
+                {step.assertions.length}
+              </span>
+            </span>
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 
-function JsonDetails({ title, value }: { title: string; value: unknown }) {
-  const [open, setOpen] = useState(false);
+function GenerationDecision({
+  summary,
+  onSuggestion,
+}: {
+  summary: FlowGenerationSummary;
+  onSuggestion: (action: SuggestionChip["action"]) => void;
+}) {
+  const diagnostics = analyzeFallbackReason(summary.fallback_reason ?? "");
+  const rejectedGroups = groupEliminated(summary.eliminated_flows ?? []);
+  const rejectedEntries = Object.entries(rejectedGroups);
+
   return (
-    <details
-      className="overflow-hidden rounded-lg border border-zinc-800 bg-zinc-900/60"
-      onToggle={(event) => {
-        setOpen((event.currentTarget as HTMLDetailsElement).open);
-      }}
-    >
-      <summary className="cursor-pointer list-none px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/70">
-        {title}
-      </summary>
-      {open && (
-        <pre className="max-h-80 overflow-auto border-t border-zinc-800 px-3 py-2 text-xs text-zinc-300">
-          {toPrettyJson(value)}
-        </pre>
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-4">
+        <MetricCard
+          label="Accepted"
+          value={summary.flows_generated}
+          tone={summary.flows_generated > 0 ? "good" : "warn"}
+          icon={CheckCircle2}
+        />
+        <MetricCard
+          label="Rejected"
+          value={summary.eliminated_flows_count ?? 0}
+          tone={(summary.eliminated_flows_count ?? 0) > 0 ? "warn" : "neutral"}
+          icon={XCircle}
+        />
+        <MetricCard
+          label="Final Source"
+          value={summary.source}
+          tone="info"
+          icon={Wand2}
+        />
+        <MetricCard
+          label="Reviewer"
+          value={summary.reviewer_applied ? "applied" : "not used"}
+          tone={summary.reviewer_applied ? "good" : "neutral"}
+        />
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <div className="rounded-lg border border-slate-800 bg-slate-950/55 p-4">
+          <h3 className="text-sm font-semibold text-slate-100">Decision Path</h3>
+          <div className="mt-3 space-y-3">
+            {[
+              ["Requested mode", summary.generation_mode ?? "—"],
+              ["Mutation policy", summary.mutation_policy ?? "—"],
+              ["LLM attempted", summary.llm_attempted ? "yes" : "no"],
+              ["Normalizations", summary.llm_normalizations_applied ?? 0],
+              ["Candidates reviewed", summary.candidate_flows_reviewed ?? 0],
+              ["Negative steps", summary.negative_flows_added ?? 0],
+              ["Generated at", formatDate(summary.batch_created_at)],
+            ].map(([label, value]) => (
+              <div key={label} className="flex items-center justify-between gap-4">
+                <span className="text-sm text-slate-500">{label}</span>
+                <span className="text-right text-sm font-medium text-slate-200">
+                  {value}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-slate-800 bg-slate-950/55 p-4">
+          <h3 className="text-sm font-semibold text-slate-100">Fallback & Hints</h3>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <MetricCard
+              label="Dependency hints"
+              value={summary.dependency_hints_count}
+              tone="neutral"
+            />
+            <MetricCard
+              label="OpenAPI links"
+              value={summary.openapi_link_hints_count}
+              tone="neutral"
+            />
+          </div>
+          {(summary.fallback_used || diagnostics.detail) && (
+            <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/10 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone="warn">{diagnostics.category}</Badge>
+                <span className="text-sm text-amber-100">
+                  {summary.fallback_used ? "Fallback was used." : "Fallback detail available."}
+                </span>
+              </div>
+              {diagnostics.detail && (
+                <p className="mt-2 text-sm text-amber-100/80">{diagnostics.detail}</p>
+              )}
+              {diagnostics.suggestions.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {diagnostics.suggestions.map((chip) => (
+                    <Button
+                      key={`${chip.action}:${chip.label}`}
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => onSuggestion(chip.action)}
+                    >
+                      {chip.label}
+                    </Button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {summary.negative_generation_skipped_reason && (
+            <InlineAlert tone="warning">
+              Negative generation skipped: {summary.negative_generation_skipped_reason}
+            </InlineAlert>
+          )}
+        </div>
+      </div>
+
+      {rejectedEntries.length > 0 && (
+        <div className="rounded-lg border border-slate-800 bg-slate-950/55 p-4">
+          <h3 className="text-sm font-semibold text-slate-100">Rejected Candidates</h3>
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            {rejectedEntries.map(([reason, items]) => (
+              <details
+                key={reason}
+                className="rounded-lg border border-slate-800 bg-slate-900/70 p-3"
+              >
+                <summary className="cursor-pointer text-sm font-medium text-slate-200">
+                  {reason} ({items.length})
+                </summary>
+                <div className="mt-3 space-y-2">
+                  {items.map((item, index) => (
+                    <div
+                      key={`${item.name}:${index}`}
+                      className="rounded-md border border-slate-800 bg-slate-950/70 px-3 py-2"
+                    >
+                      <p className="text-sm text-slate-100">{item.name}</p>
+                      <p className="mt-1 text-xs text-slate-500">{item.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            ))}
+          </div>
+        </div>
       )}
-    </details>
+    </div>
   );
 }
 
 export default function FlowTests() {
+  const [activeTab, setActiveTab] = useState<FlowTab>("generate");
   const [maxFlows, setMaxFlows] = useState(5);
   const [maxStepsPerFlow, setMaxStepsPerFlow] = useState(8);
   const [generationMode, setGenerationMode] =
@@ -283,33 +386,6 @@ export default function FlowTests() {
   );
   const allFlowsSelected =
     flows.length > 0 && selectedFlowIds.length === flows.length;
-  const fallbackDiagnostics = useMemo(
-    () => analyzeFallbackReason(generationSummary?.fallback_reason ?? ""),
-    [generationSummary]
-  );
-  const pureLLMRejectedAll =
-    generationSummary?.generation_mode === "pure_llm" &&
-    generationSummary.flows_generated === 0;
-
-  const applySuggestionChip = (action: SuggestionChip["action"]) => {
-    if (action === "deterministic_first") {
-      setGenerationMode("deterministic_first");
-      return;
-    }
-    if (action === "safe_policy") {
-      setMutationPolicy("safe");
-      return;
-    }
-    if (action === "reduce_steps") {
-      setMaxStepsPerFlow((current) => Math.max(2, Math.min(current, 6)));
-      return;
-    }
-    if (action === "disable_negative") {
-      setIncludeNegative(false);
-      return;
-    }
-    setGenerationMode("hybrid_auto");
-  };
 
   const fetchFlows = useCallback(async () => {
     setFlowsLoading(true);
@@ -317,23 +393,23 @@ export default function FlowTests() {
     try {
       const res = await listFlows(true);
       const data = unwrap(res.data);
-      const fetchedFlows = Array.isArray(data) ? data : [];
-      setFlows(fetchedFlows);
+      const fetched = Array.isArray(data) ? data : [];
+      setFlows(fetched);
       setSelectedFlowIds((prev) =>
-        prev.filter((id) => fetchedFlows.some((flow) => flow.id === id))
+        prev.filter((id) => fetched.some((flow) => flow.id === id))
       );
       setSelectedFlowId((prev) =>
-        prev && fetchedFlows.some((flow) => flow.id === prev) ? prev : null
+        prev && fetched.some((flow) => flow.id === prev) ? prev : null
       );
       setSelectedFlow((prev) =>
-        prev && fetchedFlows.some((flow) => flow.id === prev.id) ? prev : null
+        prev && fetched.some((flow) => flow.id === prev.id) ? prev : null
       );
-    } catch (error) {
+    } catch (err) {
       setFlows([]);
-      setFlowsError(extractErrorMessage(error, "Failed to load flows."));
       setSelectedFlowIds([]);
       setSelectedFlowId(null);
       setSelectedFlow(null);
+      setFlowsError(extractErrorMessage(err, "Failed to load flows."));
     } finally {
       setFlowsLoading(false);
     }
@@ -345,19 +421,19 @@ export default function FlowTests() {
     try {
       const res = await listFlowRuns(20);
       const data = unwrap(res.data);
-      const fetchedRuns = Array.isArray(data) ? data : [];
-      setRuns(fetchedRuns);
+      const fetched = Array.isArray(data) ? data : [];
+      setRuns(fetched);
       setSelectedRunId((prev) =>
-        prev && fetchedRuns.some((run) => run.id === prev) ? prev : null
+        prev && fetched.some((run) => run.id === prev) ? prev : null
       );
       setSelectedRun((prev) =>
-        prev && fetchedRuns.some((run) => run.id === prev.id) ? prev : null
+        prev && fetched.some((run) => run.id === prev.id) ? prev : null
       );
-    } catch (error) {
+    } catch (err) {
       setRuns([]);
-      setRunsError(extractErrorMessage(error, "Failed to load flow run history."));
       setSelectedRunId(null);
       setSelectedRun(null);
+      setRunsError(extractErrorMessage(err, "Failed to load flow run history."));
     } finally {
       setRunsLoading(false);
     }
@@ -369,11 +445,10 @@ export default function FlowTests() {
     setSelectedFlowId(flowId);
     try {
       const res = await getFlow(flowId);
-      const data = unwrap(res.data);
-      setSelectedFlow(data);
-    } catch (error) {
+      setSelectedFlow(unwrap(res.data));
+    } catch (err) {
       setSelectedFlow(null);
-      setFlowDetailError(extractErrorMessage(error, "Failed to load flow detail."));
+      setFlowDetailError(extractErrorMessage(err, "Failed to load flow detail."));
     } finally {
       setFlowDetailLoading(false);
     }
@@ -385,11 +460,10 @@ export default function FlowTests() {
     setSelectedRunId(runId);
     try {
       const res = await getFlowRun(runId);
-      const data = unwrap(res.data);
-      setSelectedRun(data);
-    } catch (error) {
+      setSelectedRun(unwrap(res.data));
+    } catch (err) {
       setSelectedRun(null);
-      setRunDetailError(extractErrorMessage(error, "Failed to load run detail."));
+      setRunDetailError(extractErrorMessage(err, "Failed to load run detail."));
     } finally {
       setRunDetailLoading(false);
     }
@@ -400,10 +474,25 @@ export default function FlowTests() {
     void fetchRuns();
   }, [fetchFlows, fetchRuns]);
 
+  const applySuggestionChip = (action: SuggestionChip["action"]) => {
+    if (action === "deterministic_first") {
+      setGenerationMode("deterministic_first");
+    } else if (action === "safe_policy") {
+      setMutationPolicy("safe");
+    } else if (action === "reduce_steps") {
+      setMaxStepsPerFlow((current) => Math.max(2, Math.min(current, 6)));
+    } else if (action === "disable_negative") {
+      setIncludeNegative(false);
+    } else {
+      setGenerationMode("hybrid_auto");
+    }
+    setActiveTab("generate");
+  };
+
   const handleGenerateFlows = async () => {
-    const parsedAppContext = parseJsonObject(appContextInput, "App context");
-    if (parsedAppContext.error || !parsedAppContext.value) {
-      setAppContextError(parsedAppContext.error);
+    const parsed = parseJsonObject(appContextInput, "App context");
+    if (parsed.error || !parsed.value) {
+      setAppContextError(parsed.error);
       return;
     }
     setAppContextError(null);
@@ -417,8 +506,8 @@ export default function FlowTests() {
       personas: personasInput
         .split(",")
         .map((item) => item.trim())
-        .filter((item) => item.length > 0),
-      app_context: parsedAppContext.value,
+        .filter(Boolean),
+      app_context: parsed.value,
     };
 
     setGenerating(true);
@@ -429,50 +518,52 @@ export default function FlowTests() {
       setGenerationSummary(data.summary);
       if (data.flows.length > 0) {
         await fetchFlows();
-        const firstFlow = data.flows[0];
-        setSelectedFlowId(firstFlow.id);
-        setSelectedFlow(firstFlow);
+        setSelectedFlowId(data.flows[0].id);
+        setSelectedFlow(data.flows[0]);
+        setSelectedFlowIds(data.flows.map((flow) => flow.id));
+        setActiveTab("review");
       } else {
         setSelectedFlowId(null);
         setSelectedFlow(null);
         setSelectedFlowIds([]);
+        setActiveTab("generate");
       }
-    } catch (error) {
-      setGenerateError(extractErrorMessage(error, "Failed to generate flows."));
+    } catch (err) {
+      setGenerateError(extractErrorMessage(err, "Failed to generate flows."));
     } finally {
       setGenerating(false);
     }
   };
 
   const parseInitialContextOrFail = (): Record<string, unknown> | null => {
-    const parsedInitialContext = parseJsonObject(
-      initialContextInput,
-      "Initial context"
-    );
-    if (parsedInitialContext.error || !parsedInitialContext.value) {
-      setInitialContextError(parsedInitialContext.error);
+    const parsed = parseJsonObject(initialContextInput, "Initial context");
+    if (parsed.error || !parsed.value) {
+      setInitialContextError(parsed.error);
       return null;
     }
     setInitialContextError(null);
-    return parsedInitialContext.value;
+    return parsed.value;
   };
 
-  const handleRunSelected = async () => {
-    if (selectedFlowIds.length === 0) {
+  const handleRun = async (useSelected: boolean) => {
+    if (useSelected && selectedFlowIds.length === 0) {
       setRunError("Select at least one flow before running selected.");
       return;
     }
 
     const initialContext = parseInitialContextOrFail();
-    if (!initialContext) {
-      return;
-    }
+    if (!initialContext) return;
 
-    setRunSelectedLoading(true);
+    if (useSelected) {
+      setRunSelectedLoading(true);
+    } else {
+      setRunLatestLoading(true);
+    }
     setRunError(null);
+
     try {
       const res = await runFlows({
-        flow_ids: selectedFlowIds,
+        flow_ids: useSelected ? selectedFlowIds : undefined,
         target_base_url: targetBaseUrl.trim() || undefined,
         initial_context: initialContext,
       });
@@ -482,35 +573,17 @@ export default function FlowTests() {
       if (data.flow_runs.length > 0) {
         await loadRunDetail(data.flow_runs[0].id);
       }
-    } catch (error) {
-      setRunError(extractErrorMessage(error, "Failed to run selected flows."));
+      setActiveTab("history");
+    } catch (err) {
+      setRunError(
+        extractErrorMessage(
+          err,
+          useSelected ? "Failed to run selected flows." : "Failed to run latest flow batch."
+        )
+      );
+      setActiveTab("run");
     } finally {
       setRunSelectedLoading(false);
-    }
-  };
-
-  const handleRunLatestBatch = async () => {
-    const initialContext = parseInitialContextOrFail();
-    if (!initialContext) {
-      return;
-    }
-
-    setRunLatestLoading(true);
-    setRunError(null);
-    try {
-      const res = await runFlows({
-        target_base_url: targetBaseUrl.trim() || undefined,
-        initial_context: initialContext,
-      });
-      const data = unwrap(res.data);
-      setRunGroupSummary(data);
-      await fetchRuns();
-      if (data.flow_runs.length > 0) {
-        await loadRunDetail(data.flow_runs[0].id);
-      }
-    } catch (error) {
-      setRunError(extractErrorMessage(error, "Failed to run latest flow batch."));
-    } finally {
       setRunLatestLoading(false);
     }
   };
@@ -523,398 +596,272 @@ export default function FlowTests() {
     );
   };
 
-  const handleSelectAllFlows = () => {
-    setSelectedFlowIds(flows.map((flow) => flow.id));
-  };
-
-  const handleClearFlowSelection = () => {
-    setSelectedFlowIds([]);
-  };
+  const tabs: Array<{ id: FlowTab; label: string; icon: typeof Sparkles }> = [
+    { id: "generate", label: "Generate", icon: Sparkles },
+    { id: "review", label: "Review Flows", icon: Route },
+    { id: "run", label: "Run", icon: Play },
+    { id: "history", label: "History", icon: History },
+  ];
 
   return (
-    <div className="min-h-screen bg-slate-950 p-6 text-zinc-100">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <h1 className="text-2xl font-semibold text-zinc-50">Flow Tests</h1>
+    <div className="space-y-6">
+      <PageHeader
+        title="Flow Tests"
+        description="Generate multi-step API journeys, review why candidates survived, run selected flows, and inspect step-level traces."
+        action={
+          <Button
+            variant="ghost"
+            icon={RefreshCw}
+            onClick={() => {
+              void fetchFlows();
+              void fetchRuns();
+            }}
+            loading={flowsLoading || runsLoading}
+          >
+            Refresh
+          </Button>
+        }
+      />
 
-        {/* Generate panel */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
-          <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-sm font-medium text-zinc-400">Generate Flows</h2>
-            <button
-              type="button"
-              onClick={handleGenerateFlows}
-              disabled={generating}
-              className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+      <div className="sticky top-0 z-30 -mx-4 border-b border-slate-800 bg-slate-950/92 px-4 py-3 backdrop-blur lg:top-0">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={cn(
+                  "inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                  activeTab === tab.id
+                    ? "bg-emerald-500/12 text-emerald-200 ring-1 ring-emerald-500/25"
+                    : "bg-slate-900 text-slate-400 hover:text-slate-100"
+                )}
+              >
+                <tab.icon className="size-4" />
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-sm text-slate-400">
+            <Badge tone={selectedFlowIds.length > 0 ? "info" : "neutral"}>
+              {selectedFlowIds.length} selected
+            </Badge>
+            <Button
+              size="sm"
+              variant="primary"
+              icon={Play}
+              disabled={selectedFlowIds.length === 0}
+              loading={runSelectedLoading}
+              onClick={() => void handleRun(true)}
             >
-              {generating ? (
-                <span className="inline-flex items-center gap-2">
-                  <span className="size-4 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent" />
-                  Generating
-                </span>
-              ) : (
-                "Generate Flows"
-              )}
-            </button>
+              Run Selected
+            </Button>
           </div>
+        </div>
+      </div>
 
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">Max flows</span>
-              <input
-                type="number"
-                min={1}
-                max={20}
-                value={maxFlows}
-                onChange={(event) => setMaxFlows(Number(event.target.value))}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">Max steps per flow</span>
-              <input
-                type="number"
-                min={2}
-                max={20}
-                value={maxStepsPerFlow}
-                onChange={(event) =>
-                  setMaxStepsPerFlow(Number(event.target.value))
-                }
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">Generation mode</span>
-              <select
-                value={generationMode}
-                onChange={(event) =>
-                  setGenerationMode(event.target.value as FlowGenerationMode)
-                }
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              >
-                <option value="hybrid_auto">hybrid_auto</option>
-                <option value="llm_first">llm_first</option>
-                <option value="deterministic_first">deterministic_first</option>
-                <option value="pure_llm">pure_llm</option>
-              </select>
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">Mutation policy</span>
-              <select
-                value={mutationPolicy}
-                onChange={(event) =>
-                  setMutationPolicy(event.target.value as FlowMutationPolicy)
-                }
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              >
-                <option value="safe">safe</option>
-                <option value="balanced">balanced</option>
-                <option value="full_lifecycle">full_lifecycle</option>
-              </select>
-            </label>
-
-            <label className="space-y-1 lg:col-span-2">
-              <span className="text-sm text-zinc-400">
-                Personas (comma separated)
-              </span>
-              <input
-                type="text"
-                value={personasInput}
-                onChange={(event) => setPersonasInput(event.target.value)}
-                placeholder="guest_user, registered_user"
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              />
-            </label>
-          </div>
-
-          <div className="mt-4 space-y-2">
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">App context (JSON)</span>
-              <textarea
-                value={appContextInput}
-                onChange={(event) => setAppContextInput(event.target.value)}
-                rows={5}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              />
-            </label>
-            {appContextError && (
-              <p className="text-sm text-red-400">{appContextError}</p>
-            )}
-          </div>
-
-          <label className="mt-4 inline-flex items-center gap-2 text-sm text-zinc-300">
-            <input
-              type="checkbox"
-              checked={includeNegative}
-              onChange={(event) => setIncludeNegative(event.target.checked)}
-              className="size-4 rounded border-zinc-700 bg-zinc-800 text-emerald-600 focus:ring-emerald-500/40"
-            />
-            Include negative flows
-          </label>
-
-          {generateError && (
-            <div className="mt-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-sm text-red-300">
-              {generateError}
+      {activeTab === "generate" && (
+        <div className="space-y-4">
+          <Panel title="Generate Flows" eyebrow="Configuration">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <Field label="Generation mode">
+                <Select
+                  value={generationMode}
+                  onChange={(event) =>
+                    setGenerationMode(event.target.value as FlowGenerationMode)
+                  }
+                >
+                  <option value="hybrid_auto">Hybrid auto</option>
+                  <option value="llm_first">LLM first</option>
+                  <option value="deterministic_first">Deterministic first</option>
+                  <option value="pure_llm">Pure LLM</option>
+                </Select>
+              </Field>
+              <Field label="Mutation policy">
+                <Select
+                  value={mutationPolicy}
+                  onChange={(event) =>
+                    setMutationPolicy(event.target.value as FlowMutationPolicy)
+                  }
+                >
+                  <option value="safe">Safe</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="full_lifecycle">Full lifecycle</option>
+                </Select>
+              </Field>
+              <Field label="Max flows">
+                <Input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={maxFlows}
+                  onChange={(event) => setMaxFlows(Number(event.target.value))}
+                />
+              </Field>
+              <Field label="Max steps">
+                <Input
+                  type="number"
+                  min={2}
+                  max={20}
+                  value={maxStepsPerFlow}
+                  onChange={(event) => setMaxStepsPerFlow(Number(event.target.value))}
+                />
+              </Field>
             </div>
-          )}
+
+            <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_220px]">
+              <Field
+                label="Personas"
+                hint="Optional comma-separated names, for example guest_user, admin_user."
+              >
+                <Input
+                  value={personasInput}
+                  onChange={(event) => setPersonasInput(event.target.value)}
+                  placeholder="guest_user, registered_user"
+                />
+              </Field>
+              <label className="flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={includeNegative}
+                  onChange={(event) => setIncludeNegative(event.target.checked)}
+                  className="size-4 rounded border-slate-700 bg-slate-950 text-emerald-500 focus:ring-emerald-400/30"
+                />
+                Include negative steps
+              </label>
+            </div>
+
+            <details className="mt-4 rounded-lg border border-slate-800 bg-slate-950/55 p-3">
+              <summary className="cursor-pointer text-sm font-medium text-slate-300">
+                Advanced app context JSON
+              </summary>
+              <Field
+                label="App context"
+                error={appContextError}
+                className="mt-3"
+              >
+                <Textarea
+                  rows={5}
+                  value={appContextInput}
+                  onChange={(event) => setAppContextInput(event.target.value)}
+                />
+              </Field>
+            </details>
+
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <Button
+                variant="primary"
+                icon={Sparkles}
+                loading={generating}
+                onClick={() => void handleGenerateFlows()}
+              >
+                Generate Flows
+              </Button>
+              <span className="text-sm text-slate-500">
+                Accepted flows become runnable artifacts.
+              </span>
+            </div>
+
+            {generateError && (
+              <div className="mt-4">
+                <InlineAlert tone="danger" title="Generation failed">
+                  {generateError}
+                </InlineAlert>
+              </div>
+            )}
+          </Panel>
 
           {generationSummary && (
-            <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-950/70 p-4">
-              <h3 className="mb-3 text-sm font-medium text-zinc-300">
-                Last generation summary
-              </h3>
-              {pureLLMRejectedAll && (
-                <div className="mb-3 rounded-lg border border-red-800/70 bg-red-950/30 px-3 py-2 text-sm text-red-200">
-                  Pure LLM generation produced no accepted flows. Reviewer feedback is shown below.
-                </div>
-              )}
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <div>
-                  <p className="text-xs text-zinc-500">Final source</p>
-                  <p className="text-sm text-zinc-200">{generationSummary.source}</p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Fallback used</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.fallback_used ? "yes" : "no"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Flows generated</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.flows_generated}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Dependency hints</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.dependency_hints_count}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">OpenAPI link hints</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.openapi_link_hints_count}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Requested mode</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.generation_mode ?? "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Mutation policy</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.mutation_policy ?? "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Generated at</p>
-                  <p className="text-sm text-zinc-200">
-                    {formatDate(generationSummary.batch_created_at)}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">LLM attempted</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.llm_attempted ? "yes" : "no"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">LLM normalizations</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.llm_normalizations_applied ?? 0}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Candidates reviewed</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.candidate_flows_reviewed ?? 0}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Eliminated flows</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.eliminated_flows_count ?? 0}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Reviewer applied</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.reviewer_applied ? "yes" : "no"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Reviewer mode</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.reviewer_mode ?? "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Negative steps added</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.negative_flows_added ?? 0}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">Negative generation</p>
-                  <p className="text-sm text-zinc-200">
-                    {generationSummary.negative_generation_skipped_reason
-                      ? "skipped"
-                      : "applied"}
-                  </p>
-                </div>
+            <Panel title="Last Generation Decision" eyebrow="Reviewer gate">
+              <GenerationDecision
+                summary={generationSummary}
+                onSuggestion={applySuggestionChip}
+              />
+            </Panel>
+          )}
+        </div>
+      )}
+
+      {activeTab === "review" && (
+        <div className="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+          <Panel
+            title="Latest Flow Batch"
+            action={
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon={RefreshCw}
+                  onClick={() => void fetchFlows()}
+                  loading={flowsLoading}
+                >
+                  Refresh
+                </Button>
+                <Button
+                  size="sm"
+                  variant="subtle"
+                  disabled={flows.length === 0 || allFlowsSelected}
+                  onClick={() => setSelectedFlowIds(flows.map((flow) => flow.id))}
+                >
+                  Select All
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={selectedFlowIds.length === 0}
+                  onClick={() => setSelectedFlowIds([])}
+                >
+                  Clear
+                </Button>
               </div>
-              {generationSummary.objectives_used &&
-                generationSummary.objectives_used.length > 0 && (
-                  <p className="mt-3 text-sm text-zinc-400">
-                    Objectives: {generationSummary.objectives_used.join(", ")}
-                  </p>
-                )}
-              {(generationSummary.fallback_reason || generationSummary.fallback_used) && (
-                <div className="mt-3 rounded-lg border border-amber-800/60 bg-amber-950/20 p-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm text-zinc-300">Fallback category:</span>
-                    <span className="rounded border border-amber-700/70 bg-amber-900/40 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-amber-300">
-                      {fallbackDiagnostics.category}
-                    </span>
-                  </div>
-                  {fallbackDiagnostics.detail && (
-                    <details className="mt-2 rounded border border-zinc-800 bg-zinc-950/60 p-2">
-                      <summary className="cursor-pointer text-xs text-zinc-400">
-                        Show fallback details
-                      </summary>
-                      <p className="mt-2 text-sm text-amber-300">{fallbackDiagnostics.detail}</p>
-                    </details>
-                  )}
-                  {fallbackDiagnostics.suggestions.length > 0 && (
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {fallbackDiagnostics.suggestions.map((chip) => (
-                        <button
-                          key={`${chip.action}:${chip.label}`}
-                          type="button"
-                          onClick={() => applySuggestionChip(chip.action)}
-                          className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-                        >
-                          {chip.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {generationSummary.eliminated_flows &&
-                generationSummary.eliminated_flows.length > 0 && (
-                  <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-                    <div className="mb-2 flex items-center justify-between gap-2">
-                      <p className="text-sm font-medium text-zinc-200">
-                        Eliminated flows
-                      </p>
-                      <span className="text-xs text-zinc-500">
-                        {generationSummary.eliminated_flows.length} rejected
-                      </span>
-                    </div>
-                    <div className="space-y-2">
-                      {generationSummary.eliminated_flows.map((item, index) => (
-                        <div
-                          key={`${item.name}:${item.reason_code}:${index}`}
-                          className="rounded border border-zinc-800 bg-zinc-950/60 px-3 py-2"
-                        >
-                          <p className="text-sm text-zinc-100">{item.name}</p>
-                          <p className="mt-1 text-xs uppercase tracking-wide text-red-300">
-                            {item.reason_code}
-                          </p>
-                          <p className="mt-1 text-sm text-zinc-400">{item.reason}</p>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              {generationSummary.negative_generation_skipped_reason && (
-                <p className="mt-2 text-sm text-amber-400">
-                  Negative generation skipped: {generationSummary.negative_generation_skipped_reason}
-                </p>
-              )}
-            </div>
-          )}
-        </section>
+            }
+          >
+            {flowsError && (
+              <InlineAlert tone="danger" title="Could not load flows">
+                {flowsError}
+              </InlineAlert>
+            )}
 
-        {/* Flow list + selection */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-sm font-medium text-zinc-400">
-              Latest Flow Batch
-            </h2>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={fetchFlows}
-                disabled={flowsLoading}
-                className="rounded-lg bg-slate-700 px-3 py-1.5 text-sm font-medium text-zinc-100 hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Refresh
-              </button>
-              <button
-                type="button"
-                onClick={handleSelectAllFlows}
-                disabled={flowsLoading || flows.length === 0 || allFlowsSelected}
-                className="rounded-lg bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Select All
-              </button>
-              <button
-                type="button"
-                onClick={handleClearFlowSelection}
-                disabled={flowsLoading || selectedFlowIds.length === 0}
-                className="rounded-lg bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-
-          {flowsError && (
-            <div className="mb-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-sm text-red-300">
-              {flowsError}
-            </div>
-          )}
-
-          {flowsLoading ? (
-            <div className="py-10 text-center text-zinc-500">Loading flows…</div>
-          ) : flows.length === 0 ? (
-            <div className="py-10 text-center text-zinc-500">
-              No flows found in latest batch.
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-zinc-800">
-                    <th className="w-12 px-3 py-3 text-left text-zinc-400">Sel</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Name</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Persona</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Tags</th>
-                    <th className="px-3 py-3 text-right text-zinc-400">Steps</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Created</th>
+            {flowsLoading ? (
+              <EmptyState title="Loading flows…" />
+            ) : flows.length === 0 ? (
+              <EmptyState
+                title="No flows in the latest batch"
+                description="Generate flows first, then return here to review the accepted scenarios."
+                action={
+                  <Button
+                    variant="primary"
+                    icon={Sparkles}
+                    onClick={() => setActiveTab("generate")}
+                  >
+                    Open Generator
+                  </Button>
+                }
+              />
+            ) : (
+              <DataTable>
+                <thead className={tableHeaderClass}>
+                  <tr>
+                    <th className={`${tableCellClass} w-12`}>Sel</th>
+                    <th className={tableCellClass}>Flow</th>
+                    <th className={tableCellClass}>Persona</th>
+                    <th className={tableCellClass}>Tags</th>
+                    <th className={`${tableCellClass} text-right`}>Steps</th>
+                    <th className={tableCellClass}>Created</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {flows.map((flow, index) => (
+                  {flows.map((flow) => (
                     <tr
                       key={flow.id}
                       onClick={() => void loadFlowDetail(flow.id)}
-                      className={`cursor-pointer border-b border-zinc-900/70 transition-colors hover:bg-zinc-800/50 ${
-                        selectedFlowId === flow.id
-                          ? "bg-zinc-800/60"
-                          : index % 2 === 0
-                          ? "bg-zinc-900/30"
-                          : "bg-zinc-900/10"
-                      }`}
+                      className={cn(
+                        "cursor-pointer border-b border-slate-800/70 transition-colors hover:bg-slate-800/45",
+                        selectedFlowId === flow.id && "bg-emerald-500/8"
+                      )}
                     >
-                      <td className="px-3 py-3">
+                      <td className={tableCellClass}>
                         <input
                           type="checkbox"
                           checked={selectedFlowSet.has(flow.id)}
@@ -923,389 +870,364 @@ export default function FlowTests() {
                             event.stopPropagation();
                             toggleFlowSelection(flow.id);
                           }}
-                          className="size-4 rounded border-zinc-700 bg-zinc-800 text-emerald-600 focus:ring-emerald-500/40"
+                          className="size-4 rounded border-slate-700 bg-slate-950 text-emerald-500 focus:ring-emerald-400/30"
                         />
                       </td>
-                      <td className="px-3 py-3 font-medium text-zinc-100">
-                        {flow.name}
+                      <td className={`${tableCellClass} max-w-[280px]`}>
+                        <p className="truncate font-medium text-slate-100">{flow.name}</p>
+                        <p className="mt-1 font-mono text-xs text-slate-500">
+                          {truncateMiddle(flow.id, 18)}
+                        </p>
                       </td>
-                      <td className="px-3 py-3 text-zinc-300">
+                      <td className={`${tableCellClass} text-slate-300`}>
                         {flow.persona || "—"}
                       </td>
-                      <td className="px-3 py-3 text-zinc-400">
-                        {flow.tags.length > 0 ? flow.tags.join(", ") : "—"}
+                      <td className={`${tableCellClass} text-slate-400`}>
+                        <div className="flex max-w-[260px] flex-wrap gap-1">
+                          {flow.tags.length > 0
+                            ? flow.tags.slice(0, 3).map((tag) => (
+                                <Badge key={tag} tone="neutral">
+                                  {tag}
+                                </Badge>
+                              ))
+                            : "—"}
+                        </div>
                       </td>
-                      <td className="px-3 py-3 text-right text-zinc-300">
+                      <td className={`${tableCellClass} text-right text-slate-300`}>
                         {flow.step_count}
                       </td>
-                      <td className="px-3 py-3 text-zinc-400">
+                      <td className={`${tableCellClass} text-slate-400`}>
                         {formatDate(flow.created_at)}
                       </td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
-            </div>
-          )}
-
-          {flowDetailError && (
-            <div className="mt-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-sm text-red-300">
-              {flowDetailError}
-            </div>
-          )}
-
-          {flowDetailLoading ? (
-            <div className="mt-4 text-sm text-zinc-500">Loading flow detail…</div>
-          ) : selectedFlow ? (
-            <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-950/70 p-4">
-              <div className="mb-3 flex flex-wrap items-center gap-3">
-                <h3 className="text-base font-medium text-zinc-100">
-                  {selectedFlow.name}
-                </h3>
-                <span className="rounded border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-xs text-zinc-400">
-                  {selectedFlow.persona || "no persona"}
-                </span>
-              </div>
-              {selectedFlow.description && (
-                <p className="mb-3 text-sm text-zinc-400">
-                  {selectedFlow.description}
-                </p>
-              )}
-              <div className="space-y-2">
-                {selectedFlow.steps
-                  .slice()
-                  .sort((a, b) => a.order - b.order)
-                  .map((step) => (
-                    <div
-                      key={step.step_id}
-                      className="rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2"
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-mono text-xs text-zinc-500">
-                          #{step.order}
-                        </span>
-                        <MethodBadge method={step.method} />
-                        <span className="text-sm font-medium text-zinc-200">
-                          {step.name}
-                        </span>
-                        <span className="font-mono text-xs text-zinc-400">
-                          {step.endpoint}
-                        </span>
-                      </div>
-                      <div className="mt-1 text-xs text-zinc-500">
-                        required: {step.required ? "yes" : "no"} | extracts:{" "}
-                        {step.extract.length > 0
-                          ? step.extract.map((rule) => rule.var).join(", ")
-                          : "none"}
-                      </div>
-                    </div>
-                  ))}
-              </div>
-            </div>
-          ) : null}
-        </section>
-
-        {/* Run panel */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
-          <h2 className="mb-4 text-sm font-medium text-zinc-400">Run Flows</h2>
-          <div className="grid gap-4 lg:grid-cols-2">
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">Target base URL (optional)</span>
-              <input
-                type="text"
-                value={targetBaseUrl}
-                onChange={(event) => setTargetBaseUrl(event.target.value)}
-                placeholder="https://api.example.com"
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              />
-            </label>
-            <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-sm text-zinc-400">
-              Selected flows:{" "}
-              <span className="font-semibold text-zinc-200">
-                {selectedFlowIds.length}
-              </span>
-            </div>
-          </div>
-
-          <div className="mt-4 space-y-2">
-            <label className="space-y-1">
-              <span className="text-sm text-zinc-400">Initial context (JSON)</span>
-              <textarea
-                value={initialContextInput}
-                onChange={(event) => setInitialContextInput(event.target.value)}
-                rows={5}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
-              />
-            </label>
-            {initialContextError && (
-              <p className="text-sm text-red-400">{initialContextError}</p>
+              </DataTable>
             )}
-          </div>
+          </Panel>
 
-          <div className="mt-4 flex flex-wrap gap-3">
-            <button
-              type="button"
-              onClick={handleRunSelected}
-              disabled={
-                runSelectedLoading ||
-                runLatestLoading ||
-                selectedFlowIds.length === 0
-              }
-              className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {runSelectedLoading ? (
-                <span className="inline-flex items-center gap-2">
-                  <span className="size-4 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent" />
-                  Running Selected
-                </span>
-              ) : (
-                "Run Selected"
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={handleRunLatestBatch}
-              disabled={runSelectedLoading || runLatestLoading}
-              className="rounded-lg bg-slate-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {runLatestLoading ? (
-                <span className="inline-flex items-center gap-2">
-                  <span className="size-4 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent" />
-                  Running Latest
-                </span>
-              ) : (
-                "Run Latest Batch"
-              )}
-            </button>
-          </div>
+          <Panel title="Selected Flow Detail">
+            {flowDetailError && (
+              <InlineAlert tone="danger" title="Detail failed">
+                {flowDetailError}
+              </InlineAlert>
+            )}
+            {flowDetailLoading ? (
+              <EmptyState title="Loading flow detail…" />
+            ) : selectedFlow ? (
+              <div className="space-y-4">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-base font-semibold text-slate-100">
+                      {selectedFlow.name}
+                    </h3>
+                    <Badge tone="info">{selectedFlow.persona || "no persona"}</Badge>
+                  </div>
+                  {selectedFlow.description && (
+                    <p className="mt-2 text-sm leading-6 text-slate-400">
+                      {selectedFlow.description}
+                    </p>
+                  )}
+                </div>
+                <StepTimeline steps={selectedFlow.steps} />
+                <JsonDisclosure title="Preconditions" value={selectedFlow.preconditions} />
+              </div>
+            ) : (
+              <EmptyState
+                title="Select a flow"
+                description="Click a row in the latest batch to inspect ordered steps, extracts, and assertions."
+              />
+            )}
+          </Panel>
+        </div>
+      )}
 
-          {runError && (
-            <div className="mt-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-sm text-red-300">
-              {runError}
+      {activeTab === "run" && (
+        <div className="space-y-4">
+          <Panel title="Run Flows" eyebrow="Execution">
+            <div className="grid gap-4 lg:grid-cols-[1fr_260px]">
+              <Field
+                label="Target base URL"
+                hint="Required when the spec has no server URL. Booker target: https://restful-booker.herokuapp.com"
+              >
+                <Input
+                  value={targetBaseUrl}
+                  onChange={(event) => setTargetBaseUrl(event.target.value)}
+                  placeholder="https://restful-booker.herokuapp.com"
+                />
+                <div className="mt-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="subtle"
+                    onClick={() => setTargetBaseUrl("https://restful-booker.herokuapp.com")}
+                  >
+                    Use Booker target
+                  </Button>
+                </div>
+              </Field>
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                <p className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                  Selected Flows
+                </p>
+                <p className="mt-2 text-2xl font-semibold text-slate-50">
+                  {selectedFlowIds.length}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Latest batch fallback is available if none are selected.
+                </p>
+              </div>
             </div>
-          )}
+
+            <details className="mt-4 rounded-lg border border-slate-800 bg-slate-950/55 p-3">
+              <summary className="cursor-pointer text-sm font-medium text-slate-300">
+                Advanced initial context JSON
+              </summary>
+              <Field
+                label="Initial context"
+                error={initialContextError}
+                className="mt-3"
+              >
+                <Textarea
+                  rows={5}
+                  value={initialContextInput}
+                  onChange={(event) => setInitialContextInput(event.target.value)}
+                />
+              </Field>
+            </details>
+
+            <div className="mt-4 flex flex-wrap gap-3">
+              <Button
+                variant="primary"
+                icon={Play}
+                disabled={selectedFlowIds.length === 0}
+                loading={runSelectedLoading}
+                onClick={() => void handleRun(true)}
+              >
+                Run Selected
+              </Button>
+              <Button
+                variant="secondary"
+                icon={Play}
+                loading={runLatestLoading}
+                onClick={() => void handleRun(false)}
+              >
+                Run Latest Batch
+              </Button>
+            </div>
+
+            {runError && (
+              <div className="mt-4">
+                <InlineAlert tone="danger" title="Run failed">
+                  {runError}
+                </InlineAlert>
+              </div>
+            )}
+          </Panel>
 
           {runGroupSummary && (
-            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3">
-                <p className="text-xs text-zinc-500">Total flows</p>
-                <p className="text-lg font-semibold text-zinc-100">
-                  {runGroupSummary.total_flows}
-                </p>
-              </div>
-              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3">
-                <p className="text-xs text-zinc-500">Passed</p>
-                <p className="text-lg font-semibold text-emerald-400">
-                  {runGroupSummary.passed}
-                </p>
-              </div>
-              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3">
-                <p className="text-xs text-zinc-500">Failed</p>
-                <p className="text-lg font-semibold text-red-400">
-                  {runGroupSummary.failed}
-                </p>
-              </div>
-              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3">
-                <p className="text-xs text-zinc-500">Errors</p>
-                <p className="text-lg font-semibold text-amber-400">
-                  {runGroupSummary.errors}
-                </p>
-              </div>
-            </div>
+            <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <MetricCard label="Total flows" value={runGroupSummary.total_flows} />
+              <MetricCard label="Passed" value={runGroupSummary.passed} tone="good" />
+              <MetricCard label="Failed" value={runGroupSummary.failed} tone="bad" />
+              <MetricCard label="Errors" value={runGroupSummary.errors} tone="warn" />
+            </section>
           )}
-        </section>
+        </div>
+      )}
 
-        {/* History + run detail */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-4">
-          <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-sm font-medium text-zinc-400">Flow Run History</h2>
-            <button
-              type="button"
-              onClick={fetchRuns}
-              disabled={runsLoading}
-              className="rounded-lg bg-slate-700 px-3 py-1.5 text-sm font-medium text-zinc-100 hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              Refresh
-            </button>
-          </div>
-
-          {runsError && (
-            <div className="mb-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-sm text-red-300">
-              {runsError}
-            </div>
-          )}
-
-          {runsLoading ? (
-            <div className="py-10 text-center text-zinc-500">Loading runs…</div>
-          ) : runs.length === 0 ? (
-            <div className="py-10 text-center text-zinc-500">No flow runs yet.</div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-zinc-800">
-                    <th className="px-3 py-3 text-left text-zinc-400">Run</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Flow</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Status</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Started</th>
-                    <th className="px-3 py-3 text-left text-zinc-400">Finished</th>
+      {activeTab === "history" && (
+        <div className="grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
+          <Panel
+            title="Flow Run History"
+            action={
+              <Button
+                size="sm"
+                variant="ghost"
+                icon={RefreshCw}
+                onClick={() => void fetchRuns()}
+                loading={runsLoading}
+              >
+                Refresh
+              </Button>
+            }
+          >
+            {runsError && (
+              <InlineAlert tone="danger" title="Could not load runs">
+                {runsError}
+              </InlineAlert>
+            )}
+            {runsLoading ? (
+              <EmptyState title="Loading runs…" />
+            ) : runs.length === 0 ? (
+              <EmptyState
+                title="No flow runs yet"
+                description="Run selected flows or the latest batch to populate execution history."
+                action={
+                  <Button variant="primary" icon={Play} onClick={() => setActiveTab("run")}>
+                    Open Run Panel
+                  </Button>
+                }
+              />
+            ) : (
+              <DataTable>
+                <thead className={tableHeaderClass}>
+                  <tr>
+                    <th className={tableCellClass}>Run</th>
+                    <th className={tableCellClass}>Flow</th>
+                    <th className={tableCellClass}>Status</th>
+                    <th className={tableCellClass}>Started</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {runs.map((run, index) => (
+                  {runs.map((run) => (
                     <tr
                       key={run.id}
                       onClick={() => void loadRunDetail(run.id)}
-                      className={`cursor-pointer border-b border-zinc-900/70 transition-colors hover:bg-zinc-800/50 ${
-                        selectedRunId === run.id
-                          ? "bg-zinc-800/60"
-                          : index % 2 === 0
-                          ? "bg-zinc-900/30"
-                          : "bg-zinc-900/10"
-                      }`}
+                      className={cn(
+                        "cursor-pointer border-b border-slate-800/70 transition-colors hover:bg-slate-800/45",
+                        selectedRunId === run.id && "bg-emerald-500/8"
+                      )}
                     >
-                      <td className="px-3 py-3 font-mono text-xs text-zinc-400">
-                        {run.id}
+                      <td className={`${tableCellClass} font-mono text-xs text-slate-400`}>
+                        {truncateMiddle(run.id, 18)}
                       </td>
-                      <td className="px-3 py-3 text-zinc-200">{run.flow_name}</td>
-                      <td className="px-3 py-3">
-                        <StatusBadge status={toTestStatus(run.status)} />
+                      <td className={`${tableCellClass} text-slate-200`}>
+                        {run.flow_name}
                       </td>
-                      <td className="px-3 py-3 text-zinc-400">
+                      <td className={tableCellClass}>
+                        <StatusBadge status={toStatus(run.status)} />
+                      </td>
+                      <td className={`${tableCellClass} text-slate-400`}>
                         {formatDate(run.started_at)}
-                      </td>
-                      <td className="px-3 py-3 text-zinc-400">
-                        {formatDate(run.finished_at)}
                       </td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
-            </div>
-          )}
+              </DataTable>
+            )}
+          </Panel>
 
-          {runDetailError && (
-            <div className="mt-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-sm text-red-300">
-              {runDetailError}
-            </div>
-          )}
-
-          {runDetailLoading ? (
-            <div className="mt-4 text-sm text-zinc-500">Loading run detail…</div>
-          ) : selectedRun ? (
-            <div className="mt-4 space-y-4 rounded-lg border border-zinc-800 bg-zinc-950/70 p-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <h3 className="text-base font-medium text-zinc-100">
-                  {selectedRun.flow_name}
-                </h3>
-                <StatusBadge status={toTestStatus(selectedRun.status)} />
-                <span className="font-mono text-xs text-zinc-500">
-                  {selectedRun.id}
-                </span>
-              </div>
-
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-                  <p className="text-xs text-zinc-500">Target base URL</p>
-                  <p className="font-mono text-xs text-zinc-300">
-                    {selectedRun.target_base_url}
-                  </p>
+          <Panel title="Run Detail">
+            {runDetailError && (
+              <InlineAlert tone="danger" title="Detail failed">
+                {runDetailError}
+              </InlineAlert>
+            )}
+            {runDetailLoading ? (
+              <EmptyState title="Loading run detail…" />
+            ) : selectedRun ? (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-base font-semibold text-slate-100">
+                    {selectedRun.flow_name}
+                  </h3>
+                  <StatusBadge status={toStatus(selectedRun.status)} />
+                  <Badge tone="neutral" className="font-mono">
+                    {truncateMiddle(selectedRun.id, 20)}
+                  </Badge>
                 </div>
-                <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-                  <p className="text-xs text-zinc-500">Window</p>
-                  <p className="text-sm text-zinc-300">
-                    {formatDate(selectedRun.started_at)} →{" "}
-                    {formatDate(selectedRun.finished_at)}
-                  </p>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div className="rounded-lg border border-slate-800 bg-slate-950/55 p-3">
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                      Target base URL
+                    </p>
+                    <p className="mt-2 break-all font-mono text-xs text-slate-300">
+                      {selectedRun.target_base_url}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-800 bg-slate-950/55 p-3">
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                      Run Window
+                    </p>
+                    <p className="mt-2 text-sm text-slate-300">
+                      {formatDate(selectedRun.started_at)} →{" "}
+                      {formatDate(selectedRun.finished_at)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-2 md:grid-cols-2">
+                  <JsonDisclosure title="Initial context" value={selectedRun.initial_context} />
+                  <JsonDisclosure title="Final context" value={selectedRun.final_context} />
+                </div>
+
+                <div className="space-y-3">
+                  <h4 className="text-sm font-semibold text-slate-100">Step Trace</h4>
+                  {selectedRun.step_results.length === 0 ? (
+                    <EmptyState title="No step results recorded" />
+                  ) : (
+                    selectedRun.step_results.map((step) => {
+                      const method =
+                        typeof step.resolved_request.method === "string"
+                          ? step.resolved_request.method
+                          : "UNKNOWN";
+                      const endpoint =
+                        typeof step.resolved_request.endpoint === "string"
+                          ? step.resolved_request.endpoint
+                          : typeof step.resolved_request.url === "string"
+                            ? step.resolved_request.url
+                            : step.step_id;
+
+                      return (
+                        <article
+                          key={step.id}
+                          className="rounded-lg border border-slate-800 bg-slate-950/55 p-3"
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge tone="neutral" className="font-mono">
+                              #{step.order}
+                            </Badge>
+                            <StatusBadge status={toStatus(step.status)} />
+                            <MethodBadge method={method} />
+                            <span className="break-all font-mono text-xs text-slate-400">
+                              {endpoint}
+                            </span>
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-4 text-xs text-slate-400">
+                            <span>
+                              response:{" "}
+                              <span className="font-mono text-slate-200">
+                                {step.response_status ?? "—"}
+                              </span>
+                            </span>
+                            <span>
+                              assertions:{" "}
+                              <span className="font-mono text-slate-200">
+                                {step.assertions_passed}/{step.assertions_total}
+                              </span>
+                            </span>
+                            <span>executed: {formatDate(step.executed_at)}</span>
+                          </div>
+                          {step.error_message && (
+                            <div className="mt-3">
+                              <InlineAlert tone="danger">{step.error_message}</InlineAlert>
+                            </div>
+                          )}
+                          <div className="mt-3 grid gap-2">
+                            <JsonDisclosure title="Resolved request" value={step.resolved_request} />
+                            <JsonDisclosure title="Response body" value={step.response_body} />
+                            <JsonDisclosure
+                              title="Extracted context delta"
+                              value={step.extracted_context_delta}
+                            />
+                          </div>
+                        </article>
+                      );
+                    })
+                  )}
                 </div>
               </div>
-
-              <div className="grid gap-2">
-                <JsonDetails
-                  title="Initial context"
-                  value={selectedRun.initial_context}
-                />
-                <JsonDetails title="Final context" value={selectedRun.final_context} />
-              </div>
-
-              <div className="space-y-3">
-                <h4 className="text-sm font-medium text-zinc-300">Step Trace</h4>
-                {selectedRun.step_results.length === 0 ? (
-                  <p className="text-sm text-zinc-500">No step results recorded.</p>
-                ) : (
-                  selectedRun.step_results.map((step) => {
-                    const methodCandidate = step.resolved_request["method"];
-                    const endpointCandidate = step.resolved_request["endpoint"];
-                    const urlCandidate = step.resolved_request["url"];
-                    const method =
-                      typeof methodCandidate === "string"
-                        ? methodCandidate
-                        : "UNKNOWN";
-                    const endpoint =
-                      typeof endpointCandidate === "string"
-                        ? endpointCandidate
-                        : typeof urlCandidate === "string"
-                        ? urlCandidate
-                        : step.step_id;
-
-                    return (
-                      <article
-                        key={step.id}
-                        className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3"
-                      >
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-mono text-xs text-zinc-500">
-                            #{step.order}
-                          </span>
-                          <StatusBadge status={toTestStatus(step.status)} />
-                          <MethodBadge method={method} />
-                          <span className="font-mono text-xs text-zinc-400">
-                            {endpoint}
-                          </span>
-                        </div>
-                        <div className="mt-2 flex flex-wrap gap-4 text-xs text-zinc-400">
-                          <span>
-                            response:{" "}
-                            <span className="font-mono text-zinc-200">
-                              {step.response_status ?? "—"}
-                            </span>
-                          </span>
-                          <span>
-                            assertions:{" "}
-                            <span className="font-mono text-zinc-200">
-                              {step.assertions_passed}/{step.assertions_total}
-                            </span>
-                          </span>
-                          <span>executed: {formatDate(step.executed_at)}</span>
-                        </div>
-                        {step.error_message && (
-                          <p className="mt-2 rounded border border-red-800 bg-red-950/40 px-2 py-1 text-xs text-red-300">
-                            {step.error_message}
-                          </p>
-                        )}
-                        <div className="mt-3 grid gap-2">
-                          <JsonDetails
-                            title="Resolved request"
-                            value={step.resolved_request}
-                          />
-                          <JsonDetails
-                            title="Response body"
-                            value={step.response_body}
-                          />
-                          <JsonDetails
-                            title="Extracted context delta"
-                            value={step.extracted_context_delta}
-                          />
-                        </div>
-                      </article>
-                    );
-                  })
-                )}
-              </div>
-            </div>
-          ) : null}
-        </section>
-      </div>
+            ) : (
+              <EmptyState
+                title="Select a run"
+                description="Click a history row to inspect request resolution, response bodies, assertions, and extracted context."
+              />
+            )}
+          </Panel>
+        </div>
+      )}
     </div>
   );
 }
