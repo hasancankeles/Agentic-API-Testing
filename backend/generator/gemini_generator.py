@@ -10,9 +10,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
 
-from google import genai
-from google.genai import errors as genai_errors
+import openai
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, StrictInt, StrictStr, ValidationError, field_validator
+
+from llm.client import OPENROUTER_DEFAULT_MODEL, complete_text, get_client
 
 from models.schemas import (
     GenerationMeta,
@@ -30,9 +32,8 @@ from models.schemas import (
     WebSocketTestCase,
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_PLANNER_MODEL = os.getenv("GEMINI_PLANNER_MODEL", "gemini-3.1-pro-preview")
-GEMINI_EXECUTOR_MODEL = os.getenv("GEMINI_EXECUTOR_MODEL", "gemini-3.1-flash-lite-preview")
+PLANNER_MODEL = os.getenv("GENERATOR_PLANNER_MODEL", OPENROUTER_DEFAULT_MODEL)
+EXECUTOR_MODEL = os.getenv("GENERATOR_EXECUTOR_MODEL", OPENROUTER_DEFAULT_MODEL)
 logger = logging.getLogger("agentic.generator")
 
 
@@ -421,11 +422,8 @@ Return ONLY corrected JSON that satisfies the contract. No markdown, no prose.
 T = TypeVar("T")
 
 
-def _get_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip()
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is not set")
-    return genai.Client(api_key=api_key)
+def _get_client() -> AsyncOpenAI:
+    return get_client()
 
 
 def _build_api_context(parsed_api: ParsedAPI) -> str:
@@ -735,18 +733,17 @@ def _reconcile_http_cases_with_contract(suites: list[TestSuite], parsed_api: Par
             _reconcile_success_status_with_contract(test_case, parsed_api)
 
 
-async def _call_model_text(client: genai.Client, model_name: str, prompt: str, stage: str) -> str:
+async def _call_model_text(client: AsyncOpenAI, model_name: str, prompt: str, stage: str) -> str:
     try:
-        response = await client.aio.models.generate_content(
-            model=model_name,
-            contents=prompt,
-        )
-        return response.text or ""
-    except genai_errors.ServerError as exc:
+        return await complete_text(client, model_name, prompt)
+    except openai.APIStatusError as exc:
+        retryable = exc.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+        raise UpstreamModelError(
+            f"{stage} model error: {exc}", status_code=503 if retryable else 502
+        ) from exc
+    except (openai.APIConnectionError, openai.APITimeoutError) as exc:
         raise UpstreamModelError(f"{stage} model error: {exc}", status_code=503) from exc
-    except genai_errors.ClientError as exc:
-        raise UpstreamModelError(f"{stage} model error: {exc}", status_code=502) from exc
-    except genai_errors.APIError as exc:
+    except openai.APIError as exc:
         raise UpstreamModelError(f"{stage} model error: {exc}", status_code=502) from exc
     except Exception as exc:
         lower = str(exc).lower()
@@ -795,7 +792,7 @@ def _validate_executor_case_payload(payload: Any, expected_case_id: str) -> Exec
 
 
 async def _model_validate_with_repair(
-    client: genai.Client,
+    client: AsyncOpenAI,
     model_name: str,
     prompt: str,
     stage: str,
@@ -902,7 +899,7 @@ async def plan_tests(
 
     plan, repair_attempted = await _model_validate_with_repair(
         client=client,
-        model_name=GEMINI_PLANNER_MODEL,
+        model_name=PLANNER_MODEL,
         prompt=planner_prompt,
         stage="planner",
         validator=_validate_planner_payload,
@@ -929,7 +926,7 @@ async def _executor_output(
 
     return await _model_validate_with_repair(
         client=client,
-        model_name=GEMINI_EXECUTOR_MODEL,
+        model_name=EXECUTOR_MODEL,
         prompt=executor_prompt,
         stage="executor",
         validator=_validate_executor_payload,
@@ -963,7 +960,7 @@ def _endpoint_context_for_draft(parsed_api: ParsedAPI, draft: PlannerTestCaseDra
 
 
 async def _executor_call_for_case(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     draft: PlannerTestCaseDraft,
     raw_output_observer: Callable[[str, int, bool, str], None] | None = None,
@@ -974,7 +971,7 @@ async def _executor_call_for_case(
     )
     return await _model_validate_with_repair(
         client=client,
-        model_name=GEMINI_EXECUTOR_MODEL,
+        model_name=EXECUTOR_MODEL,
         prompt=prompt,
         stage=f"executor_case:{draft.case_id}",
         validator=lambda payload: _validate_executor_case_payload(payload, draft.case_id),
@@ -993,7 +990,7 @@ def _build_http_jobs(plan: PlannerTestPlan, categories: set[TestCategory]) -> li
 
 
 async def _run_http_executor_queue(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     jobs: list[HttpExecutorJob],
     concurrency: int,
@@ -1264,8 +1261,8 @@ async def generate_all(
     )
 
     generation_meta = GenerationMeta(
-        planner_model=GEMINI_PLANNER_MODEL,
-        executor_model=GEMINI_EXECUTOR_MODEL,
+        planner_model=PLANNER_MODEL,
+        executor_model=EXECUTOR_MODEL,
         repair_attempted=planner_repair_attempted or executor_repair_attempted,
         dropped_items_count=dropped_items_count,
         executor_jobs_total=queue_result.jobs_total,

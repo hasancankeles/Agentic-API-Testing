@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Agentic API Testing Platform",
-    description="AI-powered API testing with Gemini, supporting functional tests, test suites, and load testing",
+    description="AI-powered API testing via OpenRouter (any model, default Gemini), supporting functional tests, test suites, and load testing",
     version="1.0.0",
     lifespan=lifespan,
 )

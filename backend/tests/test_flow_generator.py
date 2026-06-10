@@ -75,7 +75,7 @@ paths:
         )
 
         with (
-            patch("flows.generator.GEMINI_API_KEY", "key"),
+            patch("flows.generator.OPENROUTER_API_KEY", "key"),
             patch("flows.generator._llm_refine_flows", return_value=([llm_flow], 3)),
             patch("flows.generator._review_candidate_flows", return_value=([llm_flow], [], True)),
         ):
@@ -121,7 +121,7 @@ paths:
         req = FlowGenerateRequest(max_flows=2, max_steps_per_flow=5)
 
         with (
-            patch("flows.generator.GEMINI_API_KEY", "key"),
+            patch("flows.generator.OPENROUTER_API_KEY", "key"),
             patch("flows.generator._llm_refine_flows", side_effect=RuntimeError("bad output")),
         ):
             flows, summary = await generate_flows(parsed_api, req, "gen-2")
@@ -1030,7 +1030,7 @@ paths:
         )
 
         with (
-            patch("flows.generator.GEMINI_API_KEY", "key"),
+            patch("flows.generator.OPENROUTER_API_KEY", "key"),
             patch(
                 "flows.generator._llm_generate_candidate_flows",
                 return_value=(
@@ -1107,7 +1107,7 @@ paths:
         ]
 
         with (
-            patch("flows.generator.GEMINI_API_KEY", "key"),
+            patch("flows.generator.OPENROUTER_API_KEY", "key"),
             patch("flows.generator._llm_generate_candidate_flows", return_value=(accepted, 1, [])),
             patch("flows.generator._review_candidate_flows", return_value=(accepted, [], True)),
         ):
@@ -1293,7 +1293,7 @@ paths:
         )
 
         with (
-            patch("flows.generator.GEMINI_API_KEY", "key"),
+            patch("flows.generator.OPENROUTER_API_KEY", "key"),
             patch(
                 "flows.generator._llm_review_candidates",
                 return_value={
@@ -1371,7 +1371,7 @@ paths:
         )
 
         with (
-            patch("flows.generator.GEMINI_API_KEY", "key"),
+            patch("flows.generator.OPENROUTER_API_KEY", "key"),
             patch(
                 "flows.generator._llm_review_candidates",
                 return_value={

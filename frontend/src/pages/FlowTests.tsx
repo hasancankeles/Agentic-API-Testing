@@ -80,7 +80,7 @@ function analyzeFallbackReason(reason: string): FallbackDiagnostics {
   if (!detail) return { category: "none", detail: "", suggestions: [] };
 
   const lowered = detail.toLowerCase();
-  if (lowered.includes("api key") || lowered.includes("missing_gemini_api_key")) {
+  if (lowered.includes("api key") || lowered.includes("missing_openrouter_api_key")) {
     return {
       category: "configuration",
       detail,

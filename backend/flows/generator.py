@@ -10,9 +10,11 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from google import genai
-from google.genai import errors as genai_errors
+import openai
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
+
+from llm.client import OPENROUTER_DEFAULT_MODEL, complete_text, get_client
 
 from models.schemas import (
     FlowEliminatedCandidate,
@@ -30,8 +32,8 @@ from models.schemas import (
 
 logger = logging.getLogger("agentic.flow_generator")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-FLOW_PLANNER_MODEL = os.getenv("FLOW_PLANNER_MODEL", "gemini-3.1-flash-lite-preview")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+FLOW_PLANNER_MODEL = os.getenv("FLOW_PLANNER_MODEL", OPENROUTER_DEFAULT_MODEL)
 FLOW_COMPOSER_MODEL = os.getenv("FLOW_COMPOSER_MODEL", FLOW_PLANNER_MODEL)
 FLOW_CRITIC_MODEL = os.getenv("FLOW_CRITIC_MODEL", FLOW_PLANNER_MODEL)
 FLOW_REVIEWER_MODEL = os.getenv("FLOW_REVIEWER_MODEL", FLOW_CRITIC_MODEL)
@@ -82,8 +84,8 @@ class _FlowReviewEnvelope(BaseModel):
     decisions: list[_FlowReviewDecision] = Field(default_factory=list)
 
 
-def _get_gemini_api_key() -> str:
-    return os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip()
+def _get_api_key() -> str:
+    return (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY).strip()
 
 
 def _default_expected_status(method: HttpMethod) -> int:
@@ -2387,7 +2389,7 @@ def _inject_negative_step(
 
 
 async def _llm_json_call(
-    client: genai.Client,
+    client: AsyncOpenAI,
     model: str,
     prompt: str,
     label: str,
@@ -2397,11 +2399,8 @@ async def _llm_json_call(
 
     for attempt in range(2):
         try:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=base_prompt,
-            )
-            payload = _parse_json_response(response.text or "")
+            text = await complete_text(client, model, base_prompt)
+            payload = _parse_json_response(text)
             return payload
         except Exception as exc:
             last_error = exc
@@ -2417,7 +2416,7 @@ async def _llm_json_call(
 
 
 async def _llm_plan_scenarios(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
     objectives: list[str],
@@ -2481,7 +2480,7 @@ async def _llm_plan_scenarios(
 
 
 async def _llm_compose_flows(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
     objectives: list[str],
@@ -2581,7 +2580,7 @@ async def _llm_compose_flows(
 
 
 async def _llm_critic_repair(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
     flows: list[FlowScenario],
@@ -2663,7 +2662,7 @@ def _pure_llm_candidate_limit(req: FlowGenerateRequest) -> int:
 
 
 async def _llm_generate_candidate_flows(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
     objectives: list[str],
@@ -2779,7 +2778,7 @@ async def _llm_generate_candidate_flows(
 
 
 async def _llm_review_candidates(
-    client: genai.Client,
+    client: AsyncOpenAI,
     parsed_api: ParsedAPI,
     req: FlowGenerateRequest,
     flows: list[tuple[str, FlowScenario]],
@@ -2856,11 +2855,11 @@ async def _review_candidate_flows(
     if not reviewable:
         return [], eliminated, False
 
-    api_key = _get_gemini_api_key()
+    api_key = _get_api_key()
     if not api_key:
-        raise FlowGeneratorError("reviewer_missing_gemini_api_key")
+        raise FlowGeneratorError("reviewer_missing_openrouter_api_key")
 
-    client = genai.Client(api_key=api_key)
+    client = get_client(api_key)
     decisions = await _llm_review_candidates(client, parsed_api, req, reviewable)
 
     accepted: list[FlowScenario] = []
@@ -2903,11 +2902,11 @@ async def _llm_refine_flows(
     dependency_hints: list[dict],
     objectives: list[str],
 ) -> tuple[list[FlowScenario], int]:
-    api_key = _get_gemini_api_key()
+    api_key = _get_api_key()
     if not api_key:
-        raise FlowGeneratorError("GEMINI_API_KEY is not set")
+        raise FlowGeneratorError("OPENROUTER_API_KEY is not set")
 
-    client = genai.Client(api_key=api_key)
+    client = get_client(api_key)
 
     try:
         scenarios = await _llm_plan_scenarios(client, parsed_api, req, objectives, dependency_hints)
@@ -2922,7 +2921,7 @@ async def _llm_refine_flows(
         )
         criticized, critic_normalizations = await _llm_critic_repair(client, parsed_api, req, composed)
         return criticized, compose_normalizations + critic_normalizations
-    except genai_errors.APIError as exc:
+    except openai.APIError as exc:
         raise FlowGeneratorError(f"flow planner upstream error: {exc}") from exc
     except Exception as exc:
         raise FlowGeneratorError(f"flow planner error: {exc}") from exc
@@ -2952,7 +2951,7 @@ async def generate_flows(
     eliminated_flows: list[FlowEliminatedCandidate] = []
 
     mode = req.generation_mode
-    api_key_present = bool(_get_gemini_api_key())
+    api_key_present = bool(_get_api_key())
     created_at = datetime.utcnow()
 
     if mode == FlowGenerationMode.PURE_LLM:
@@ -2961,10 +2960,10 @@ async def generate_flows(
         candidate_flows = []
         fallback_reason = ""
         if not api_key_present:
-            fallback_reason = "missing_gemini_api_key"
+            fallback_reason = "missing_openrouter_api_key"
         else:
             try:
-                client = genai.Client(api_key=_get_gemini_api_key())
+                client = get_client(_get_api_key())
                 generated_flows, normalization_count, schema_invalid = await _llm_generate_candidate_flows(
                     client,
                     parsed_api,
@@ -2996,7 +2995,7 @@ async def generate_flows(
             fallback_reason = ""
         else:  # LLM_FIRST
             llm_should_run = api_key_present
-            fallback_reason = "" if api_key_present else "missing_gemini_api_key"
+            fallback_reason = "" if api_key_present else "missing_openrouter_api_key"
 
         if llm_should_run and api_key_present:
             llm_attempted = True
