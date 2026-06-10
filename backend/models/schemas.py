@@ -31,6 +31,12 @@ class HttpMethod(str, Enum):
     HEAD = "HEAD"
 
 
+class LoadTestPreset(str, Enum):
+    SMOKE = "smoke"
+    LOAD = "load"
+    STRESS = "stress"
+
+
 # ── OpenAPI parsed models ──
 
 
@@ -48,6 +54,8 @@ class ParsedResponse(BaseModel):
     content_type: str = "application/json"
     schema_ref: str | None = None
     example: Any = None
+    examples: dict[str, Any] = Field(default_factory=dict)
+    links: dict[str, Any] = Field(default_factory=dict)
 
 
 class ParsedEndpoint(BaseModel):
@@ -59,7 +67,12 @@ class ParsedEndpoint(BaseModel):
     tags: list[str] = Field(default_factory=list)
     parameters: list[ParsedParameter] = Field(default_factory=list)
     responses: list[ParsedResponse] = Field(default_factory=list)
+    security: list[dict[str, Any]] = Field(default_factory=list)
+    requires_auth: bool = False
     request_body: dict[str, Any] | None = None
+    request_body_required_fields: list[str] = Field(default_factory=list)
+    request_body_example: Any = None
+    response_examples: dict[str, Any] = Field(default_factory=dict)
 
 
 class ParsedWebSocketMessage(BaseModel):
@@ -313,6 +326,32 @@ class LoadTestScenario(BaseModel):
     ramp_stages: list[dict[str, Any]] = Field(default_factory=list)
     thresholds: dict[str, list[str]] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, Any] = Field(default_factory=dict)
+    body: Any = None
+    expected_statuses: list[int] = Field(default_factory=lambda: [200])
+
+    @field_validator("expected_statuses")
+    @classmethod
+    def validate_expected_statuses(cls, expected_statuses: list[int]) -> list[int]:
+        cleaned: list[int] = []
+        seen: set[int] = set()
+        for status in expected_statuses or [200]:
+            value = int(status)
+            if value < 100 or value > 599:
+                raise ValueError("expected_statuses values must be between 100 and 599")
+            if value not in seen:
+                cleaned.append(value)
+                seen.add(value)
+        if not cleaned:
+            cleaned = [200]
+        return cleaned
+
+
+class LoadTestProfile(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    default_headers: dict[str, str] = Field(default_factory=dict)
 
 
 class LoadTestMetrics(BaseModel):
@@ -335,7 +374,38 @@ class LoadTestMetrics(BaseModel):
     executed_at: datetime = Field(default_factory=datetime.utcnow)
     duration_seconds: float = 0
     vus_max: int = 0
+    runner_status: str = "passed"
+    runner_message: str = ""
+    runner_exit_code: int | None = None
+    runner_stdout_excerpt: str = ""
+    runner_stderr_excerpt: str = ""
+    metric_shape: str | None = None
+    request_count_source: str | None = None
+    error_rate_source: str | None = None
+    parse_warnings: list[str] = Field(default_factory=list)
     raw_metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class LoadTestScenarioUpsertRequest(BaseModel):
+    id: str = ""
+    name: str
+    description: str = ""
+    target_url: str
+    method: HttpMethod = HttpMethod.GET
+    vus: int = 10
+    duration: str = "30s"
+    ramp_stages: list[dict[str, Any]] = Field(default_factory=list)
+    thresholds: dict[str, list[str]] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, Any] = Field(default_factory=dict)
+    body: Any = None
+    expected_statuses: list[int] = Field(default_factory=lambda: [200])
+    preset: LoadTestPreset | None = None
+
+    @field_validator("expected_statuses")
+    @classmethod
+    def validate_expected_statuses(cls, expected_statuses: list[int]) -> list[int]:
+        return LoadTestScenario.validate_expected_statuses(expected_statuses)
 
 
 # ── Dashboard ──
@@ -366,6 +436,155 @@ class GenerationMeta(BaseModel):
     executor_concurrency: int = 0
 
 
+# ── Flow models ──
+
+
+class FlowExtractSource(str, Enum):
+    BODY = "body"
+    HEADERS = "headers"
+    STATUS_CODE = "status_code"
+
+
+class FlowRunStatus(str, Enum):
+    PASSED = "passed"
+    FAILED = "failed"
+    ERROR = "error"
+    RUNNING = "running"
+
+
+class FlowGenerationMode(str, Enum):
+    HYBRID_AUTO = "hybrid_auto"
+    LLM_FIRST = "llm_first"
+    DETERMINISTIC_FIRST = "deterministic_first"
+    PURE_LLM = "pure_llm"
+
+
+class FlowMutationPolicy(str, Enum):
+    SAFE = "safe"
+    BALANCED = "balanced"
+    FULL_LIFECYCLE = "full_lifecycle"
+
+
+class FlowExtractRule(BaseModel):
+    var: StrictStr
+    source: FlowExtractSource = Field(default=FlowExtractSource.BODY, alias="from")
+    path: str = ""
+    required: bool = True
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("var")
+    @classmethod
+    def validate_var(cls, var: str) -> str:
+        if not var.strip():
+            raise ValueError("extract.var must not be empty")
+        return var.strip()
+
+
+class FlowStep(BaseModel):
+    step_id: StrictStr
+    order: StrictInt
+    name: StrictStr
+    method: HttpMethod = HttpMethod.GET
+    endpoint: StrictStr
+    headers: dict[str, Any] = Field(default_factory=dict)
+    query_params: dict[str, Any] = Field(default_factory=dict)
+    path_params: dict[str, Any] = Field(default_factory=dict)
+    body: Any = None
+    extract: list[FlowExtractRule] = Field(default_factory=list)
+    assertions: list[TestAssertion] = Field(default_factory=list)
+    expected_status: int | None = None
+    required: bool = True
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, endpoint: str) -> str:
+        return _validate_normalized_path(endpoint, "flow_step.endpoint")
+
+    @field_validator("order")
+    @classmethod
+    def validate_order(cls, order: int) -> int:
+        if order <= 0:
+            raise ValueError("flow_step.order must be >= 1")
+        return order
+
+    @field_validator("expected_status")
+    @classmethod
+    def validate_expected_status(cls, expected_status: int | None) -> int | None:
+        if expected_status is None:
+            return None
+        if expected_status < 100 or expected_status > 599:
+            raise ValueError("expected_status must be between 100 and 599")
+        return expected_status
+
+
+class FlowScenario(BaseModel):
+    id: str = ""
+    name: str
+    description: str = ""
+    persona: str = ""
+    preconditions: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    steps: list[FlowStep] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    source_generation_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_steps(self) -> "FlowScenario":
+        step_ids: set[str] = set()
+        orders: set[int] = set()
+        for step in self.steps:
+            if step.step_id in step_ids:
+                raise ValueError(f"Duplicate flow step_id found: {step.step_id}")
+            step_ids.add(step.step_id)
+
+            if step.order in orders:
+                raise ValueError(f"Duplicate flow step.order found: {step.order}")
+            orders.add(step.order)
+
+        ordered = [step.order for step in self.steps]
+        if ordered != sorted(ordered):
+            raise ValueError("Flow steps must be ordered by ascending step.order")
+        return self
+
+
+class FlowEliminatedCandidate(BaseModel):
+    name: str
+    reason_code: str
+    reason: str
+
+
+class FlowStepResult(BaseModel):
+    id: str = ""
+    flow_run_id: str
+    flow_id: str
+    step_id: str
+    order: int
+    status: TestStatus
+    resolved_request: dict[str, Any] = Field(default_factory=dict)
+    response_status: int | None = None
+    response_headers: dict[str, Any] = Field(default_factory=dict)
+    response_body: Any = None
+    assertions_passed: int = 0
+    assertions_total: int = 0
+    extracted_context_delta: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    executed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class FlowRunRecord(BaseModel):
+    id: str
+    flow_id: str
+    flow_name: str
+    status: FlowRunStatus
+    target_base_url: str
+    initial_context: dict[str, Any] = Field(default_factory=dict)
+    final_context: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime
+    finished_at: datetime | None = None
+    step_results: list[FlowStepResult] = Field(default_factory=list)
+
+
 # ── API request/response models ──
 
 
@@ -388,4 +607,23 @@ class ExecuteRequest(BaseModel):
 
 class LoadTestRunRequest(BaseModel):
     scenario_ids: list[str] | None = None
-    target_base_url: str = "http://localhost:8080"
+    target_base_url: str | None = None
+    profile_id: str | None = None
+    headers_override: dict[str, str] = Field(default_factory=dict)
+
+
+class FlowGenerateRequest(BaseModel):
+    max_flows: int = Field(default=5, ge=1, le=20)
+    max_steps_per_flow: int = Field(default=8, ge=2, le=20)
+    objectives: list[str] = Field(default_factory=list)
+    include_negative: bool = True
+    generation_mode: FlowGenerationMode = FlowGenerationMode.HYBRID_AUTO
+    mutation_policy: FlowMutationPolicy = FlowMutationPolicy.SAFE
+    app_context: dict[str, Any] = Field(default_factory=dict)
+    personas: list[str] = Field(default_factory=list)
+
+
+class FlowRunRequest(BaseModel):
+    flow_ids: list[str] | None = None
+    target_base_url: str | None = None
+    initial_context: dict[str, Any] = Field(default_factory=dict)

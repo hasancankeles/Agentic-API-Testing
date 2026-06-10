@@ -1,39 +1,28 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { ChevronDown, Play, RefreshCw } from "lucide-react";
 import {
-  getSuites,
+  executeTests,
   getSuite,
   getSuiteResults,
-  executeTests,
+  getSuites,
   type Suite,
   type TestResult,
 } from "../api/client";
-import TestCard from "../components/TestCard";
-import type { TestStatus } from "../components/StatusBadge";
+import {
+  Badge,
+  Button,
+  EmptyState,
+  InlineAlert,
+  MethodBadge,
+  PageHeader,
+  Panel,
+  StatusBadge,
+} from "../components/ui";
+import { cn, extractErrorMessage, toStatus } from "../lib/ui";
 
 function unwrap<T>(res: { data?: T } | T): T {
   const d = res as { data?: T };
   return (d.data !== undefined ? d.data : res) as T;
-}
-
-const methodStyles: Record<string, string> = {
-  GET: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  POST: "bg-blue-500/20 text-blue-400 border-blue-500/30",
-  PUT: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  DELETE: "bg-red-500/20 text-red-400 border-red-500/30",
-  PATCH: "bg-violet-500/20 text-violet-400 border-violet-500/30",
-};
-
-function MethodBadge({ method }: { method: string }) {
-  const style =
-    methodStyles[method.toUpperCase()] ??
-    "bg-zinc-500/20 text-zinc-400 border-zinc-500/30";
-  return (
-    <span
-      className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-mono font-medium ${style}`}
-    >
-      {method}
-    </span>
-  );
 }
 
 export default function TestSuites() {
@@ -43,9 +32,7 @@ export default function TestSuites() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedSuite, setExpandedSuite] = useState<Suite | null>(null);
   const [expandedLoading, setExpandedLoading] = useState(false);
-  const [suiteResults, setSuiteResults] = useState<Record<string, TestResult[]>>(
-    {}
-  );
+  const [suiteResults, setSuiteResults] = useState<Record<string, TestResult[]>>({});
   const [runLoading, setRunLoading] = useState<string | null>(null);
 
   const fetchSuites = useCallback(async () => {
@@ -55,8 +42,8 @@ export default function TestSuites() {
       const res = await getSuites();
       const data = unwrap(res.data);
       setSuites(Array.isArray(data) ? data : []);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load suites");
+    } catch (err) {
+      setError(extractErrorMessage(err, "Failed to load suites."));
       setSuites([]);
     } finally {
       setLoading(false);
@@ -64,43 +51,40 @@ export default function TestSuites() {
   }, []);
 
   useEffect(() => {
-    fetchSuites();
+    void fetchSuites();
   }, [fetchSuites]);
 
-  const fetchExpandedSuite = useCallback(
-    async (id: string) => {
-      setExpandedLoading(true);
+  const fetchExpandedSuite = useCallback(async (id: string) => {
+    setExpandedLoading(true);
+    setExpandedSuite(null);
+    try {
+      const [suiteRes, resultsRes] = await Promise.all([
+        getSuite(id),
+        getSuiteResults(id),
+      ]);
+      const suiteData = unwrap(suiteRes.data);
+      const resultsData = unwrap(resultsRes.data);
+      setExpandedSuite(suiteData as Suite);
+      setSuiteResults((prev) => ({
+        ...prev,
+        [id]: Array.isArray(resultsData) ? resultsData : [],
+      }));
+    } catch {
       setExpandedSuite(null);
-      try {
-        const [suiteRes, resultsRes] = await Promise.all([
-          getSuite(id),
-          getSuiteResults(id),
-        ]);
-        const suiteData = unwrap(suiteRes.data);
-        const resultsData = unwrap(resultsRes.data);
-        setExpandedSuite(suiteData as Suite);
-        setSuiteResults((prev) => ({
-          ...prev,
-          [id]: Array.isArray(resultsData) ? resultsData : [],
-        }));
-      } catch {
-        setExpandedSuite(null);
-        setSuiteResults((prev) => ({ ...prev, [id]: [] }));
-      } finally {
-        setExpandedLoading(false);
-      }
-    },
-    []
-  );
+      setSuiteResults((prev) => ({ ...prev, [id]: [] }));
+    } finally {
+      setExpandedLoading(false);
+    }
+  }, []);
 
   const toggleExpand = (id: string) => {
     if (expandedId === id) {
       setExpandedId(null);
       setExpandedSuite(null);
-    } else {
-      setExpandedId(id);
-      fetchExpandedSuite(id);
+      return;
     }
+    setExpandedId(id);
+    void fetchExpandedSuite(id);
   };
 
   const handleRunSuite = async (suiteId: string) => {
@@ -112,203 +96,214 @@ export default function TestSuites() {
       if (expandedId === suiteId) {
         await fetchExpandedSuite(suiteId);
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to run suite");
+    } catch (err) {
+      setError(extractErrorMessage(err, "Failed to run suite."));
     } finally {
       setRunLoading(null);
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-zinc-100 p-6">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <h1 className="text-2xl font-semibold text-zinc-50">Test Suites</h1>
+    <div className="space-y-6">
+      <PageHeader
+        title="Test Suites"
+        description="Review generated functional and WebSocket suites, run focused groups, and inspect their latest case results."
+        action={
+          <Button
+            variant="ghost"
+            icon={RefreshCw}
+            onClick={() => void fetchSuites()}
+            loading={loading}
+          >
+            Refresh
+          </Button>
+        }
+      />
 
-        {error && (
-          <div className="rounded-lg border border-red-800 bg-red-950/50 px-4 py-2 text-red-300">
-            {error}
-          </div>
-        )}
+      {error && (
+        <InlineAlert tone="danger" title="Suite action failed">
+          {error}
+        </InlineAlert>
+      )}
 
+      <Panel title="Generated Suites" eyebrow={`${suites.length} suites`}>
         {loading ? (
-          <div className="flex items-center justify-center py-16">
-            <span className="animate-pulse text-zinc-400">Loading suites…</span>
-          </div>
+          <EmptyState title="Loading suites…" />
+        ) : suites.length === 0 ? (
+          <EmptyState
+            title="No test suites found"
+            description="Generate tests from the dashboard first, then return here to inspect and run suites."
+          />
         ) : (
-          <div className="space-y-4">
-            {suites.length === 0 ? (
-              <p className="py-8 text-center text-zinc-500">No test suites found</p>
-            ) : (
-              suites.map((suite) => (
+          <div className="space-y-3">
+            {suites.map((suite) => {
+              const isExpanded = expandedId === suite.id;
+              const latestResults = suiteResults[suite.id] ?? [];
+              return (
                 <article
                   key={suite.id}
-                  className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/80"
+                  className={cn(
+                    "overflow-hidden rounded-lg border border-slate-800 bg-slate-950/45",
+                    isExpanded && "border-emerald-500/25"
+                  )}
                 >
-                  <button
-                    type="button"
-                    onClick={() => toggleExpand(suite.id)}
-                    className="flex w-full items-center justify-between p-4 text-left transition-colors hover:bg-zinc-800/50"
-                  >
-                    <div className="flex flex-wrap items-center gap-3">
-                      <h2 className="font-medium text-zinc-100">{suite.name}</h2>
-                      <span className="rounded border border-zinc-600 bg-zinc-800/50 px-2 py-0.5 text-xs text-zinc-400">
-                        {suite.category}
-                      </span>
-                      <span className="text-sm text-zinc-500">
-                        {suite.test_count} tests
-                      </span>
-                      <span className="text-sm text-emerald-400">
-                        {suite.passed} passed
-                      </span>
-                      <span className="text-sm text-red-400">
-                        {suite.failed} failed
-                      </span>
-                      <span className="text-sm text-amber-400">
-                        {suite.errors} errors
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
+                  <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center lg:justify-between">
+                    <button
+                      type="button"
+                      onClick={() => toggleExpand(suite.id)}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h2 className="font-semibold text-slate-100">{suite.name}</h2>
+                        <Badge tone="neutral">{suite.category}</Badge>
+                        <Badge tone="info">{suite.test_count} tests</Badge>
+                      </div>
+                      {suite.description && (
+                        <p className="mt-2 max-w-4xl text-sm leading-6 text-slate-500">
+                          {suite.description}
+                        </p>
+                      )}
+                      <div className="mt-3 flex flex-wrap gap-3 text-sm">
+                        <span className="text-emerald-300">{suite.passed} passed</span>
+                        <span className="text-red-300">{suite.failed} failed</span>
+                        <span className="text-amber-300">{suite.errors} errors</span>
+                      </div>
+                    </button>
+
+                    <div className="flex shrink-0 items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        icon={Play}
+                        loading={runLoading === suite.id}
+                        onClick={() => void handleRunSuite(suite.id)}
+                      >
+                        Run Suite
+                      </Button>
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleRunSuite(suite.id);
-                        }}
-                        disabled={runLoading === suite.id}
-                        className="rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-medium text-zinc-100 hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        type="button"
+                        onClick={() => toggleExpand(suite.id)}
+                        aria-label={isExpanded ? "Collapse suite" : "Expand suite"}
+                        className="flex size-9 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-800 hover:text-slate-100"
                       >
-                        {runLoading === suite.id ? (
-                          <span className="inline-flex items-center gap-1">
-                            <span className="size-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
-                            Running
-                          </span>
-                        ) : (
-                          "Run Suite"
-                        )}
+                        <ChevronDown
+                          className={cn(
+                            "size-4 transition-transform",
+                            isExpanded && "rotate-180"
+                          )}
+                        />
                       </button>
-                      <span
-                        className={`text-zinc-500 transition-transform ${
-                          expandedId === suite.id ? "rotate-180" : ""
-                        }`}
-                      >
-                        ▼
-                      </span>
                     </div>
-                  </button>
+                  </div>
 
-                  {expandedId === suite.id && (
-                    <div className="border-t border-zinc-800 bg-zinc-950/50 p-4">
+                  {isExpanded && (
+                    <div className="border-t border-slate-800 bg-slate-950/55 p-4">
                       {expandedLoading ? (
-                        <div className="py-4 text-center text-sm text-zinc-500">
-                          Loading…
-                        </div>
+                        <EmptyState title="Loading suite detail…" />
                       ) : expandedSuite?.id === suite.id ? (
-                        <>
-                      {expandedSuite.description && (
-                        <p className="mb-4 text-sm text-zinc-400">
-                          {expandedSuite.description}
-                        </p>
-                      )}
-
-                      {/* Test cases */}
-                      {expandedSuite.test_cases &&
-                        expandedSuite.test_cases.length > 0 && (
-                          <div className="mb-4">
-                            <h3 className="mb-2 text-sm font-medium text-zinc-400">
-                              HTTP Test Cases
-                            </h3>
-                            <div className="space-y-2">
-                              {expandedSuite.test_cases.map((tc) => (
-                                <div
-                                  key={tc.id}
-                                  className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-3 py-2"
-                                >
-                                  <span className="font-medium text-zinc-200">
-                                    {tc.name}
-                                  </span>
-                                  <span className="font-mono text-sm text-zinc-500">
-                                    {tc.endpoint}
-                                  </span>
-                                  <MethodBadge method={tc.method} />
-                                  <span className="text-xs text-zinc-500">
-                                    Expected: {tc.expected_status}
-                                  </span>
+                        <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+                          <div className="space-y-4">
+                            {(expandedSuite.test_cases?.length ?? 0) > 0 && (
+                              <div>
+                                <h3 className="text-sm font-semibold text-slate-100">
+                                  HTTP Test Cases
+                                </h3>
+                                <div className="mt-3 space-y-2">
+                                  {expandedSuite.test_cases?.map((testCase) => (
+                                    <div
+                                      key={testCase.id}
+                                      className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2"
+                                    >
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="font-medium text-slate-100">
+                                          {testCase.name}
+                                        </span>
+                                        <MethodBadge method={testCase.method} />
+                                        <Badge tone="neutral">
+                                          expected {testCase.expected_status}
+                                        </Badge>
+                                      </div>
+                                      <p className="mt-2 break-all font-mono text-xs text-slate-500">
+                                        {testCase.endpoint}
+                                      </p>
+                                    </div>
+                                  ))}
                                 </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
+                              </div>
+                            )}
 
-                      {/* WebSocket test cases */}
-                      {expandedSuite.ws_test_cases &&
-                        expandedSuite.ws_test_cases.length > 0 && (
-                          <div className="mb-4">
-                            <h3 className="mb-2 text-sm font-medium text-zinc-400">
-                              WebSocket Test Cases
-                            </h3>
-                            <div className="space-y-2">
-                              {expandedSuite.ws_test_cases.map((ws) => (
-                                <div
-                                  key={ws.id}
-                                  className="rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-3 py-2"
-                                >
-                                  <span className="font-medium text-zinc-200">
-                                    {ws.name}
-                                  </span>
-                                  {ws.description && (
-                                    <p className="mt-1 text-sm text-zinc-500">
-                                      {ws.description}
-                                    </p>
-                                  )}
-                                  <span className="text-xs text-zinc-500">
-                                    {ws.steps?.length ?? 0} steps
-                                  </span>
+                            {(expandedSuite.ws_test_cases?.length ?? 0) > 0 && (
+                              <div>
+                                <h3 className="text-sm font-semibold text-slate-100">
+                                  WebSocket Test Cases
+                                </h3>
+                                <div className="mt-3 space-y-2">
+                                  {expandedSuite.ws_test_cases?.map((testCase) => (
+                                    <div
+                                      key={testCase.id}
+                                      className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2"
+                                    >
+                                      <p className="font-medium text-slate-100">
+                                        {testCase.name}
+                                      </p>
+                                      <p className="mt-2 break-all font-mono text-xs text-slate-500">
+                                        {testCase.url}
+                                      </p>
+                                      <Badge tone="neutral">
+                                        {testCase.steps.length} steps
+                                      </Badge>
+                                    </div>
+                                  ))}
                                 </div>
-                              ))}
-                            </div>
+                              </div>
+                            )}
                           </div>
-                        )}
 
-                      {/* Suite results */}
-                      {suiteResults[suite.id] &&
-                        suiteResults[suite.id].length > 0 && (
                           <div>
-                            <h3 className="mb-2 text-sm font-medium text-zinc-400">
-                              Suite Results
+                            <h3 className="text-sm font-semibold text-slate-100">
+                              Latest Results
                             </h3>
-                            <div className="grid gap-2 sm:grid-cols-2">
-                              {suiteResults[suite.id].map((r) => (
-                                <TestCard
-                                  key={r.id}
-                                  name={r.test_case_name}
-                                  endpoint={r.endpoint}
-                                  method={r.method}
-                                  status={(r.status as TestStatus) || "pending"}
-                                  responseTime={r.response_time_ms}
-                                  expectedStatus={r.expected_status}
-                                  actualStatus={r.actual_status}
+                            {latestResults.length === 0 ? (
+                              <div className="mt-3">
+                                <EmptyState
+                                  title="No result history for this suite"
+                                  description="Run the suite to populate latest case statuses."
                                 />
-                              ))}
-                            </div>
+                              </div>
+                            ) : (
+                              <div className="mt-3 space-y-2">
+                                {latestResults.map((result) => (
+                                  <div
+                                    key={result.id}
+                                    className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2"
+                                  >
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <span className="font-medium text-slate-100">
+                                        {result.test_case_name}
+                                      </span>
+                                      <StatusBadge status={toStatus(result.status)} />
+                                    </div>
+                                    <p className="mt-2 text-xs text-slate-500">
+                                      {result.assertions_passed}/{result.assertions_total} assertions,
+                                      status {result.actual_status ?? "—"}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
-                        )}
-
-                      {(!suiteResults[suite.id] ||
-                        suiteResults[suite.id].length === 0) && (
-                        <p className="text-sm text-zinc-500">
-                          No results for this suite yet. Run the suite to see
-                          results.
-                        </p>
+                        </div>
+                      ) : (
+                        <EmptyState title="Could not load suite detail" />
                       )}
-                        </>
-                      ) : null}
                     </div>
                   )}
                 </article>
-              ))
-            )}
+              );
+            })}
           </div>
         )}
-      </div>
+      </Panel>
     </div>
   );
 }
